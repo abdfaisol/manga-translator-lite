@@ -8,10 +8,12 @@ from PIL import Image
 
 from core.text.font_manager import (
     LRUCache,
+    get_symbol_font,
+    get_symbol_typeface,
     get_variable_font_style_info,
     load_font_data,
 )
-from core.text.layout_engine import shape_line
+from core.text.layout_engine import shape_line, split_fallback_runs
 from core.text.text_processing import is_rtl_script, parse_styled_segments
 from utils.exceptions import FontError, RenderingError
 from utils.logging import log_message
@@ -23,6 +25,7 @@ _font_cache_lock = threading.RLock()
 OUTLINE_MIN_PX = 1.0
 OUTLINE_MAX_PX = 6.0
 OUTLINE_REF_PX = 36.0
+HB_26_6_SCALE_FACTOR = 64.0
 
 
 def resolve_outline_width(
@@ -357,7 +360,6 @@ def draw_layout(
                         )
                         continue
 
-                    HB_26_6_SCALE_FACTOR = 64.0
                     left = line_data.get("left", 0.0)
                     right = line_data.get("right", line_data.get("width", 0.0))
                     top = line_data.get("top", -line_data.get("height", 0.0))
@@ -377,38 +379,73 @@ def draw_layout(
                         canvas.drawRect(rect, bg_paint)
 
                     builder = skia.TextBlobBuilder()
-                    glyph_ids = [info.codepoint for info in infos]
+                    glyph_ids = []
                     skia_point_positions = []
                     segment_cursor_x = 0.0
 
-                    for _, pos in zip(infos, positions):
+                    # Characters missing from the primary font are drawn with
+                    # a platform fallback typeface; one blob per typeface run.
+                    blob_font = skia_font_segment
+
+                    def _flush_blob(font):
+                        nonlocal builder
+                        if not glyph_ids:
+                            return
+                        try:
+                            builder.allocRunPos(
+                                font, list(glyph_ids), list(skia_point_positions)
+                            )
+                            text_blob = builder.make()
+                            if text_blob:
+                                if outline_paint:
+                                    canvas.drawTextBlob(text_blob, 0, 0, outline_paint)
+                                canvas.drawTextBlob(text_blob, 0, 0, paint)
+                        except Exception as e:
+                            log_message(
+                                f"Skia rendering error for '{segment_text}': {e}",
+                                always_print=True,
+                            )
+                        glyph_ids.clear()
+                        skia_point_positions.clear()
+                        builder = skia.TextBlobBuilder()
+
+                    char_by_byte = {}
+                    byte_offset = 0
+                    for char in segment_text:
+                        char_by_byte[byte_offset] = char
+                        byte_offset += len(char.encode("utf-8"))
+
+                    for info, pos in zip(infos, positions):
+                        glyph_id = info.codepoint
+                        glyph_font = blob_font
+                        if glyph_id == 0:
+                            char = char_by_byte.get(info.cluster, "")
+                            symbol_typeface = (
+                                get_symbol_typeface(ord(char)) if char else None
+                            )
+                            if symbol_typeface is None:
+                                continue
+                            glyph_font = get_symbol_font(
+                                symbol_typeface, final_font_size
+                            )
+                            glyph_id = glyph_font.unicharToGlyph(ord(char))
+                            if glyph_id == 0:
+                                continue
+                            if glyph_font is not blob_font:
+                                _flush_blob(blob_font)
+                                blob_font = glyph_font
+
                         glyph_x = (
                             baseline_x
                             + segment_cursor_x
                             + (pos.x_offset / HB_26_6_SCALE_FACTOR)
                         )
                         glyph_y = baseline_y - (pos.y_offset / HB_26_6_SCALE_FACTOR)
+                        glyph_ids.append(glyph_id)
                         skia_point_positions.append(skia.Point(glyph_x, glyph_y))
                         segment_cursor_x += pos.x_advance / HB_26_6_SCALE_FACTOR
 
-                    try:
-                        _ = builder.allocRunPos(
-                            skia_font_segment, glyph_ids, skia_point_positions
-                        )
-                        text_blob = builder.make()
-                        if text_blob:
-                            if outline_paint:
-                                canvas.drawTextBlob(text_blob, 0, 0, outline_paint)
-                            canvas.drawTextBlob(text_blob, 0, 0, paint)
-                            log_message(
-                                f"Rendered vertical '{segment_text}' ({style_name})",
-                                verbose=verbose,
-                            )
-                    except Exception as e:
-                        log_message(
-                            f"Skia rendering error for '{segment_text}': {e}",
-                            always_print=True,
-                        )
+                    _flush_blob(blob_font)
 
             else:
                 current_baseline_y = first_baseline_y
@@ -459,31 +496,67 @@ def draw_layout(
                         hb_scale = int(final_font_size * 64)
                         hb_font_segment.scale = (hb_scale, hb_scale)
 
-                        try:
-                            infos, positions, _ = shape_line(
-                                segment_text, hb_font_segment, features_to_enable
-                            )
-                            if not infos:
-                                log_message(
-                                    f"No glyphs for segment '{segment_text}'",
-                                    verbose=verbose,
+                        # Shape each coverage run: primary-font runs via
+                        # HarfBuzz, symbol runs via the platform fallback font.
+                        # Runs: (skia font, glyph ids, advances, hb positions|None)
+                        shaped_runs = []
+                        for chunk, symbol_typeface in split_fallback_runs(
+                            segment_text, hb_font_segment
+                        ):
+                            if symbol_typeface is not None:
+                                symbol_font = get_symbol_font(
+                                    symbol_typeface, final_font_size
+                                )
+                                glyphs = [
+                                    symbol_font.unicharToGlyph(ord(char))
+                                    for char in chunk
+                                ]
+                                shaped_runs.append(
+                                    (
+                                        symbol_font,
+                                        glyphs,
+                                        symbol_font.getWidths(glyphs),
+                                        None,
+                                    )
                                 )
                                 continue
-                        except Exception as e:
+
+                            try:
+                                infos, positions, _ = shape_line(
+                                    chunk, hb_font_segment, features_to_enable
+                                )
+                            except Exception as e:
+                                log_message(
+                                    f"Shaping failed for '{chunk}': {e}",
+                                    always_print=True,
+                                )
+                                continue
+                            if not infos:
+                                continue
+
+                            shaped_runs.append(
+                                (
+                                    skia_font_segment,
+                                    [info.codepoint for info in infos],
+                                    [
+                                        pos.x_advance / HB_26_6_SCALE_FACTOR
+                                        for pos in positions
+                                    ],
+                                    positions,
+                                )
+                            )
+
+                        if not shaped_runs:
                             log_message(
-                                f"Shaping failed for '{segment_text}': {e}",
-                                always_print=True,
+                                f"No glyphs for segment '{segment_text}'",
+                                verbose=verbose,
                             )
                             continue
 
                         builder = skia.TextBlobBuilder()
-                        glyph_ids = [info.codepoint for info in infos]
-                        skia_point_positions = []
                         segment_cursor_x = 0.0
-                        HB_26_6_SCALE_FACTOR = 64.0
-                        segment_width_calculated = (
-                            sum(pos.x_advance for pos in positions)
-                            / HB_26_6_SCALE_FACTOR
+                        segment_width_calculated = sum(
+                            sum(run[2]) for run in shaped_runs
                         )
 
                         if is_line_rtl:
@@ -492,22 +565,31 @@ def draw_layout(
                         else:
                             segment_start_x = cursor_x
 
-                        for _, pos in zip(infos, positions):
-                            glyph_x = (
-                                segment_start_x
-                                + segment_cursor_x
-                                + (pos.x_offset / HB_26_6_SCALE_FACTOR)
+                        for run_font, glyph_ids, run_advances, run_positions in (
+                            shaped_runs
+                        ):
+                            skia_point_positions = []
+                            for index, glyph_id in enumerate(glyph_ids):
+                                x_offset = 0.0
+                                y_offset = 0.0
+                                if run_positions is not None:
+                                    pos = run_positions[index]
+                                    x_offset = pos.x_offset / HB_26_6_SCALE_FACTOR
+                                    y_offset = pos.y_offset / HB_26_6_SCALE_FACTOR
+                                skia_point_positions.append(
+                                    skia.Point(
+                                        segment_start_x
+                                        + segment_cursor_x
+                                        + x_offset,
+                                        current_baseline_y - y_offset,
+                                    )
+                                )
+                                segment_cursor_x += run_advances[index]
+                            builder.allocRunPos(
+                                run_font, glyph_ids, skia_point_positions
                             )
-                            glyph_y = current_baseline_y - (
-                                pos.y_offset / HB_26_6_SCALE_FACTOR
-                            )
-                            skia_point_positions.append(skia.Point(glyph_x, glyph_y))
-                            segment_cursor_x += pos.x_advance / HB_26_6_SCALE_FACTOR
 
                         try:
-                            _ = builder.allocRunPos(
-                                skia_font_segment, glyph_ids, skia_point_positions
-                            )
                             text_blob = builder.make()
                             if text_blob:
                                 if outline_paint:

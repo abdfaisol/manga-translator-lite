@@ -211,6 +211,7 @@ class MangaTranslatorConfig:
     cleaning_only: bool = False
     upscaling_only: bool = False
     test_mode: bool = False
+    mask_preview_only: bool = False
     processing_scale: float = 1.0
     parallel_requests: int = 1
     batch_parallel_within_pages: bool = False

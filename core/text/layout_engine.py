@@ -5,6 +5,7 @@ import numpy as np
 import skia
 import uharfbuzz as hb
 
+from core.text.font_manager import get_symbol_font, get_symbol_typeface
 from core.text.text_processing import (
     NO_SPACE_BEFORE_MARKER,
     STYLE_PATTERN,
@@ -25,6 +26,8 @@ VISUAL_WIDTH_EPSILON = 0.0
 HB_26_6_SCALE_FACTOR = 64.0
 VERTICAL_ADVANCE_TRACKING = 0.90
 VERTICAL_GROUPED_PUNCTUATION = set(".,;:!?…。．！？｡")
+# Hard floor used only when nothing fits at the configured min font size.
+ABSOLUTE_MIN_FONT_SIZE = 4
 
 
 def shape_line(
@@ -66,6 +69,35 @@ def calculate_line_width(positions: list[hb.GlyphPosition]) -> float:
     return visual_width + VISUAL_WIDTH_EPSILON
 
 
+def split_fallback_runs(
+    text: str, hb_font: hb.Font
+) -> list[tuple[str, skia.Typeface | None]]:
+    """Split text into runs of primary-font and platform-fallback coverage.
+
+    Returns (chunk, typeface) pairs; typeface is None when the primary font
+    covers the chunk, otherwise the fallback typeface to draw it with.
+    """
+    runs: list[list] = []
+    for char in text:
+        typeface = None
+        if not char.isspace() and hb_font.get_nominal_glyph(ord(char)) is None:
+            typeface = get_symbol_typeface(ord(char))
+        if runs and runs[-1][1] is typeface:
+            runs[-1][0] += char
+        else:
+            runs.append([char, typeface])
+    return [(chunk, typeface) for chunk, typeface in runs]
+
+def measure_fallback_chunk(
+    chunk: str, typeface: skia.Typeface, font_size: float
+) -> float:
+    """Advance width of a fallback chunk, matching what drawing will use."""
+    font = get_symbol_font(typeface, font_size)
+    glyphs = [font.unicharToGlyph(ord(char)) for char in chunk]
+    if not glyphs:
+        return 0.0
+    return float(sum(font.getWidths(glyphs)))
+
 def calculate_styled_line_width(
     line_with_markers: str,
     font_size: int,
@@ -105,19 +137,26 @@ def calculate_styled_line_width(
         hb_scale = int(font_size * 64)
         hb_font_segment.scale = (hb_scale, hb_scale)
 
-        _, positions, _ = shape_line(segment_text, hb_font_segment, features)
-        if not positions:
-            continue
+        for chunk, symbol_typeface in split_fallback_runs(segment_text, hb_font_segment):
+            if symbol_typeface is not None:
+                total_advance_fixed_all += int(
+                    measure_fallback_chunk(chunk, symbol_typeface, font_size)
+                    * HB_26_6_SCALE_FACTOR
+                )
+                continue
 
-        total_advance_fixed_all += sum(pos.x_advance for pos in positions)
-        if first_offset_fixed_global is None:
-            first_offset_fixed_global = positions[0].x_offset
-        last_offset_fixed_global = positions[-1].x_offset
+            _, positions, _ = shape_line(chunk, hb_font_segment, features)
+            if not positions:
+                continue
+
+            total_advance_fixed_all += sum(pos.x_advance for pos in positions)
+            if first_offset_fixed_global is None:
+                first_offset_fixed_global = positions[0].x_offset
+            last_offset_fixed_global = positions[-1].x_offset
 
     if total_advance_fixed_all == 0 and first_offset_fixed_global is None:
         return 0.0
 
-    HB_26_6_SCALE_FACTOR = 64.0
     offset_delta_fixed = 0
     if first_offset_fixed_global is not None and last_offset_fixed_global is not None:
         offset_delta_fixed = last_offset_fixed_global - first_offset_fixed_global
@@ -163,6 +202,45 @@ def _iter_vertical_units(text: str) -> list[tuple[str, str]]:
     return units
 
 
+def _measure_vertical_symbol_unit(
+    text: str,
+    style_name: str,
+    font_size: int,
+) -> dict | None:
+    """Vertical unit drawn entirely with a platform fallback font.
+
+    The primary font has no glyphs for these characters, so measure them with
+    the same font the drawing path will use.
+    """
+    typefaces = [get_symbol_typeface(ord(char)) for char in text]
+    typeface = typefaces[0] if typefaces else None
+    if typeface is None or any(t is not typeface for t in typefaces):
+        return None
+
+    font = get_symbol_font(typeface, font_size)
+    glyphs = [font.unicharToGlyph(ord(char)) for char in text]
+    if not glyphs or 0 in glyphs:
+        return None
+
+    width = max(1.0, float(sum(font.getWidths(glyphs))))
+    metrics = font.getMetrics()
+    ascent = max(0.0, -metrics.fAscent)
+    descent = max(0.0, metrics.fDescent)
+    height = max(1.0, ascent + descent)
+
+    return {
+        "text_with_markers": text,
+        "style": style_name,
+        "width": width,
+        "height": height,
+        "advance_height": max(height, float(font_size)),
+        "baseline_offset_y": ascent,
+        "left": 0.0,
+        "right": width,
+        "top": -ascent,
+        "bottom": descent,
+    }
+
 def _measure_vertical_unit(
     text: str,
     style_name: str,
@@ -178,6 +256,11 @@ def _measure_vertical_unit(
     hb_font.ptem = float(font_size)
     hb_scale = int(font_size * 64)
     hb_font.scale = (hb_scale, hb_scale)
+
+    if text and all(
+        hb_font.get_nominal_glyph(ord(char)) is None for char in text
+    ):
+        return _measure_vertical_symbol_unit(text, style_name, font_size)
 
     infos, positions, _ = shape_line(text, hb_font, features)
     if not infos or not positions:
@@ -717,97 +800,105 @@ def find_optimal_layout(
 
     word_width_cache: dict[tuple[str, int], float] = {}
 
-    low = min_font_size
-    high = max_font_size
+    def _search(floor: int) -> None:
+        """Binary-search the largest size in [floor, max_font_size] that fits."""
+        nonlocal best_fit_size, best_fit_lines_data, best_fit_metrics
+        nonlocal best_fit_max_line_width, best_fit_line_height, best_fit_block_height
 
-    while low <= high:
-        mid = (low + high) // 2
-        if mid == 0:
-            break
+        low = floor
+        high = max_font_size
 
-        log_message(f"Testing size {mid}", verbose=verbose)
-
-        succeeded_at_current_size = False
-        current_width_attempt = max_render_width
-        max_squeezes = 3 if cleaned_mask is not None else 1
-
-        for _ in range(max_squeezes):
-            fit_data = check_fit(
-                mid,
-                clean_text,
-                current_width_attempt,
-                max_render_height,
-                regular_hb_face,
-                regular_typeface,
-                loaded_hb_faces,
-                features_to_enable,
-                line_spacing_mult,
-                hyphenate_before_scaling,
-                hyphen_penalty,
-                hyphenation_min_word_length,
-                badness_exponent,
-                word_width_cache,
-                verbose,
-                detach_trailing_punctuation,
-                vertical_stack,
-            )
-
-            if fit_data is None:
-                # Squeezing narrower won't help (only makes it taller)
+        while low <= high:
+            mid = (low + high) // 2
+            if mid == 0:
                 break
 
-            if (
-                cleaned_mask is not None
-                and box_top_left is not None
-                and not vertical_stack
-            ):
-                has_collision = _check_collision(
-                    fit_data["lines"],
-                    box_top_left,
-                    cleaned_mask,
-                    fit_data["line_height"],
-                    (current_width_attempt, max_render_height),
+            log_message(f"Testing size {mid}", verbose=verbose)
+
+            succeeded_at_current_size = False
+            current_width_attempt = max_render_width
+            max_squeezes = 3 if cleaned_mask is not None else 1
+
+            for _ in range(max_squeezes):
+                fit_data = check_fit(
+                    mid,
+                    clean_text,
+                    current_width_attempt,
+                    max_render_height,
+                    regular_hb_face,
+                    regular_typeface,
+                    loaded_hb_faces,
+                    features_to_enable,
+                    line_spacing_mult,
+                    hyphenate_before_scaling,
+                    hyphen_penalty,
+                    hyphenation_min_word_length,
+                    badness_exponent,
+                    word_width_cache,
+                    verbose,
+                    detach_trailing_punctuation,
+                    vertical_stack,
                 )
 
-                if not has_collision:
-                    best_fit_size = mid
-                    best_fit_lines_data = fit_data["lines"]
-                    best_fit_metrics = fit_data["metrics"]
-                    best_fit_max_line_width = fit_data["max_line_width"]
-                    best_fit_line_height = fit_data["line_height"]
-                    best_fit_block_height = fit_data.get("block_height", 0.0)
-
-                    succeeded_at_current_size = True
+                if fit_data is None:
+                    # Squeezing narrower won't help (only makes it taller)
                     break
-                else:
-                    log_message(
-                        f"Collision at size {mid} width {current_width_attempt:.0f}, squeezing...",
-                        verbose=verbose,
+
+                if (
+                    cleaned_mask is not None
+                    and box_top_left is not None
+                    and not vertical_stack
+                ):
+                    has_collision = _check_collision(
+                        fit_data["lines"],
+                        box_top_left,
+                        cleaned_mask,
+                        fit_data["line_height"],
+                        (current_width_attempt, max_render_height),
                     )
-                    current_width_attempt *= 0.90
-                    continue
-            else:
+
+                    if has_collision:
+                        log_message(
+                            f"Collision at size {mid} width {current_width_attempt:.0f}, squeezing...",
+                            verbose=verbose,
+                        )
+                        current_width_attempt *= 0.90
+                        continue
+
                 best_fit_size = mid
                 best_fit_lines_data = fit_data["lines"]
                 best_fit_metrics = fit_data["metrics"]
                 best_fit_max_line_width = fit_data["max_line_width"]
                 best_fit_line_height = fit_data["line_height"]
                 best_fit_block_height = fit_data.get("block_height", 0.0)
+
                 succeeded_at_current_size = True
                 break
 
-        if succeeded_at_current_size:
-            low = mid + 1
-        else:
-            high = mid - 1
+            if succeeded_at_current_size:
+                low = mid + 1
+            else:
+                high = mid - 1
+
+    _search(min_font_size)
+
+    if best_fit_size == -1 and min_font_size > ABSOLUTE_MIN_FONT_SIZE:
+        # Nothing fits at the configured floor; go below it rather than dropping
+        # the translation (small/tight boxes would otherwise keep the source text).
+        log_message(
+            f"Text too large for bubble at min size {min_font_size}, "
+            f"shrinking to fit: '{clean_text[:30]}'",
+            always_print=True,
+        )
+        _search(ABSOLUTE_MIN_FONT_SIZE)
 
     if best_fit_size == -1:
         log_message(
-            f"Text too large for bubble at min size {min_font_size}: '{clean_text[:30]}'",
+            f"Text too large for bubble at min size {ABSOLUTE_MIN_FONT_SIZE}: '{clean_text[:30]}'",
             always_print=True,
         )
         raise RenderingError(
-            f"Text too large for bubble at minimum font size {min_font_size}"
+            f"Text too large for bubble at minimum font size {ABSOLUTE_MIN_FONT_SIZE}"
         )
 
     if best_fit_size < max_font_size:

@@ -14,6 +14,7 @@ from core.image.image_utils import cv2_to_pil, pil_to_cv2, process_bubble_image_
 from core.image.ocr_detection import (
     extract_text_with_manga_ocr,
     extract_text_with_paddle_ocr_vl,
+    extract_text_with_rapidocr,
 )
 from utils.endpoints import (
     call_anthropic_endpoint,
@@ -84,10 +85,264 @@ TRANSLATION_PATTERN = re.compile(
 )
 
 
+AUTO_LANGUAGE_TOKENS = frozenset(
+    {"auto", "automatic", "auto-detect", "autodetect", "detect"}
+)
+
+def is_auto_language(input_language: str | None) -> bool:
+    """True when the source language should be detected by the model."""
+    return (input_language or "").strip().lower() in AUTO_LANGUAGE_TOKENS
+
+_JAPANESE_LANGUAGE_TOKENS = frozenset({"japanese", "ja", "jpn", "jp"})
+
+def is_japanese_language(input_language: str | None) -> bool:
+    """True when the source language is Japanese.
+
+    manga-ocr only handles Japanese; everything else (including Auto) needs
+    PaddleOCR-VL-1.6. See docs/TROUBLESHOOTING.md.
+    """
+    lang = (input_language or "").strip().lower()
+    primary = lang.replace("-", " ").replace("_", " ").split(" ")[0]
+    return primary in _JAPANESE_LANGUAGE_TOKENS
+
+_RAPIDOCR_LANGUAGE_TOKENS = frozenset(
+    {"chinese (simplified)", "chinese (traditional)", "chinese", "english"}
+)
+
+def is_rapidocr_language(input_language: str | None) -> bool:
+    """True when PP-OCRv4 Mobile's built-in dictionary covers the language.
+
+    The dictionary holds Chinese, ASCII Latin and shared Hanzi. Kana, Hangul and
+    accented Latin are outside it, so those need manga-ocr or a vision LLM.
+    """
+    return (input_language or "").strip().lower() in _RAPIDOCR_LANGUAGE_TOKENS
+
+_KOREAN_LANGUAGE_TOKENS = frozenset({"korean", "ko", "kor", "kr"})
+
+def is_korean_language(input_language: str | None) -> bool:
+    """True when the source language is Korean.
+
+    The PP-OCRv5 Korean recogniser in models/rapidocr/ reads Hangul offline.
+    """
+    lang = (input_language or "").strip().lower()
+    primary = lang.replace("-", " ").replace("_", " ").split(" ")[0]
+    return primary in _KOREAN_LANGUAGE_TOKENS
+
+def resolve_ocr_engine(ocr_method: str | None, source_language: str | None) -> str:
+    """Return the concrete OCR engine for an OCR method + source language pair.
+
+    Explicit methods are honoured as-is. "Auto" routes by source language:
+    Japanese -> manga-ocr, Korean -> rapidocr-korean, Chinese/English ->
+    rapidocr, anything else (including an Auto source) -> LLM, the only engine
+    that can read an unknown script.
+    """
+    method = (ocr_method or "").strip()
+    if method.lower() not in AUTO_LANGUAGE_TOKENS:
+        return method
+    if is_japanese_language(source_language):
+        return "manga-ocr"
+    if is_korean_language(source_language):
+        return "rapidocr-korean"
+    if is_rapidocr_language(source_language):
+        return "rapidocr"
+    return "LLM"
+
+_SCRIPT_PATTERNS = (
+    ("korean", re.compile(r"[\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]")),
+    ("japanese", re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")),
+    ("chinese", re.compile(r"[\u4e00-\u9fff]")),
+    ("latin", re.compile(r"[A-Za-z\u00c0-\u024f]")),
+)
+
+def infer_script_from_texts(texts: list[str] | None) -> str | None:
+    """Guess the page's writing system from OCR text that already succeeded.
+
+    Cheap Unicode-range voting (no model, no network). Returns "korean",
+    "japanese", "chinese", "latin" or None when nothing usable is present.
+    """
+    usable = [
+        t
+        for t in (texts or [])
+        if t
+        and t.strip()
+        and "[OCR FAILED]" not in t
+        and "[OCR Error" not in t
+        and "Missing item" not in t
+    ]
+    combined = " ".join(usable)
+    if not combined.strip():
+        return None
+
+    counts = {
+        name: len(pattern.findall(combined)) for name, pattern in _SCRIPT_PATTERNS
+    }
+    if counts["korean"]:
+        return "korean"
+    if counts["japanese"]:
+        return "japanese"
+    if counts["chinese"]:
+        return "chinese"
+    if counts["latin"]:
+        return "latin"
+    return None
+
+def _is_failed_ocr_text(text: str | None) -> bool:
+    """True for blank, [OCR FAILED] or endpoint-error entries."""
+    stripped = (text or "").strip()
+    return (
+        not stripped
+        or stripped.upper() == "[OCR FAILED]"
+        or "[OCR Error" in stripped
+        or "Missing item" in stripped
+        or "OCR failed]" in stripped
+    )
+
+
+def _crop_is_blank(crop: Image.Image, ink_threshold: float = 0.02) -> bool:
+    """True when a crop has almost no ink — an empty bubble, not text.
+
+    A blank bubble is white paper plus maybe a border, so under ~2% dark
+    pixels. Real manga text bubbles measure 10-18%, so there is wide margin.
+    """
+    try:
+        hist = crop.convert("L").histogram()
+        return sum(hist[:140]) / max(1, sum(hist)) < ink_threshold
+    except Exception:
+        return False
+
+
+def _matches_script(text: str, script: str | None) -> bool:
+    """True when text contains at least one character of the given script."""
+    pattern = dict(_SCRIPT_PATTERNS).get(script or "")
+    return bool(pattern and pattern.search(text))
+
+def retry_failed_ocr_locally(
+    crops: list[Image.Image | None],
+    ocr_texts: list[str],
+    source_language: str | None = None,
+    primary_engine: str | None = None,
+    verbose: bool = False,
+) -> list[str]:
+    """Retry failed crops offline, then normalize leftover endpoint errors.
+
+    Raw HTTP 504 HTML dumps are noise in the UI; `[OCR FAILED]` is the sentinel
+    downstream already understands and it keeps the original art untouched.
+    """
+    return [
+        "[OCR FAILED]"
+        if ("[OCR Error" in t or "OCR failed]" in t or "Missing item" in t)
+        else t
+        for t in _retry_failed_ocr_locally_impl(
+            crops,
+            ocr_texts,
+            source_language=source_language,
+            primary_engine=primary_engine,
+            verbose=verbose,
+        )
+    ]
+
+
+def _retry_failed_ocr_locally_impl(
+    crops: list[Image.Image | None],
+    ocr_texts: list[str],
+    source_language: str | None = None,
+    primary_engine: str | None = None,
+    verbose: bool = False,
+) -> list[str]:
+    """Re-read failed crops with a local OCR engine chosen by the page's script.
+
+    Vision LLMs can refuse a crop (safety filter) or time out, and PP-OCRv4
+    silently returns "" on faint text. The rest of the page usually still
+    succeeds, so its script tells us which offline engine can recover the
+    stragglers: manga-ocr for Kana, PP-OCRv4 for Hanzi/Latin, PP-OCRv5 Korean
+    for Hangul.
+
+    Only the failed crops are processed, so the cost is a few hundred ms.
+    """
+    if not crops or not ocr_texts or len(crops) != len(ocr_texts):
+        return ocr_texts
+
+    failed_indices = [
+        i
+        for i, t in enumerate(ocr_texts)
+        if _is_failed_ocr_text(t)
+        and crops[i] is not None
+        and not _crop_is_blank(crops[i])
+    ]
+    # Nothing failed, or nothing succeeded to infer a script from.
+    if not failed_indices or len(failed_indices) == len(ocr_texts):
+        return ocr_texts
+
+    script = infer_script_from_texts(ocr_texts)
+    # Give priority to actual detected script from the page's successful items,
+    # falling back to user's configured source language.
+    if script == "japanese" or (script is None and is_japanese_language(source_language)):
+        engine = "manga-ocr"
+    elif script == "korean" or (script is None and is_korean_language(source_language)):
+        engine = "rapidocr-korean"
+    elif script in ("chinese", "latin") or (script is None and is_rapidocr_language(source_language)):
+        engine = "rapidocr"
+    else:
+        # Unknown script: no local engine can help.
+        return ocr_texts
+
+    # Retrying with the engine that just failed would only repeat the failure.
+    if engine == (primary_engine or "").strip():
+        return ocr_texts
+
+    failed_crops = [crops[i] for i in failed_indices]
+    try:
+        if engine == "manga-ocr":
+            fallback = extract_text_with_manga_ocr(failed_crops, verbose=verbose)
+        elif engine == "rapidocr-korean":
+            fallback = extract_text_with_rapidocr(
+                failed_crops, verbose=verbose, language="korean"
+            )
+        else:
+            fallback = extract_text_with_rapidocr(failed_crops, verbose=verbose)
+    except Exception as e:
+        log_message(f"Local OCR retry failed: {e}", always_print=True)
+        return ocr_texts
+
+    if not fallback or len(fallback) != len(failed_crops):
+        return ocr_texts
+
+    # Recogniser-only engines invent text for non-text art, so require the
+    # result to look like the script we inferred. A Korean bubble always
+    # contains Hangul, so Latin-only garbage (page numbers, art) is rejected.
+    # ponytail: a hallucinated string in the right script can still slip
+    # through; add a confidence score or text-box detector if it bites.
+    allowed_scripts = {
+        "manga-ocr": ("japanese",),
+        "rapidocr-korean": ("korean",),
+    }.get(engine, ())
+
+    recovered = list(ocr_texts)
+    for idx, text in zip(failed_indices, fallback):
+        cleaned = (text or "").strip()
+        if (
+            cleaned
+            and not _is_failed_ocr_text(cleaned)
+            and (
+                not allowed_scripts
+                or any(_matches_script(cleaned, s) for s in allowed_scripts)
+            )
+        ):
+            recovered[idx] = cleaned
+            log_message(
+                f"Local {engine} OCR recovered item {idx + 1}: {cleaned}",
+                always_print=True,
+            )
+    return recovered
+
 def _build_system_prompt_ocr(
     input_language: str | None,
     ero_doujinshi_mode: bool = False,
 ) -> str:
+    auto_detect = is_auto_language(input_language)
+    if auto_detect:
+        input_language = None
+
     lang_label = (
         f"{input_language.strip()} "
         if input_language and input_language.strip()
@@ -102,11 +357,18 @@ def _build_system_prompt_ocr(
         or primary_code in no_space_codes
     )
 
-    spacing_rule = (
-        "Do not insert spaces between collapsed lines unless an explicit space existed in the original text."
-        if is_no_space_lang
-        else "Separate collapsed lines with a single space."
-    )
+    if auto_detect:
+        spacing_rule = (
+            "Detect the source language automatically and collapse multi-line text "
+            "using that language's spacing conventions (no inserted spaces for "
+            "Japanese/Chinese, a single space otherwise)."
+        )
+    elif is_no_space_lang:
+        spacing_rule = (
+            "Do not insert spaces between collapsed lines unless an explicit space existed in the original text."
+        )
+    else:
+        spacing_rule = "Separate collapsed lines with a single space."
 
     ero_doujinshi_section = ""
     if ero_doujinshi_mode:
@@ -188,6 +450,9 @@ def _build_system_prompt_translation(
     ocr_correction: bool = False,
     input_language: str | None = None,
 ) -> str:
+    if is_auto_language(input_language):
+        input_language = None
+
     input_type = "transcribed text lines" if mode == "two-step" else "cropped images"
     visual_ref_note = (
         " Refer to the full-page context image to resolve visual context, speaker identities, and off-bubble SFX."
@@ -1656,6 +1921,52 @@ def _perform_paddle_ocr_vl(
     return extracted_texts
 
 
+def _perform_rapidocr(
+    images_b64: list[str],
+    bubble_metadata: list[dict[str, Any]],
+    debug: bool = False,
+    language: str | None = None,
+) -> list[str]:
+    """Perform OCR using a PP-OCR recogniser (Chinese + Latin, or Korean).
+
+    Local, ~0.05 s per crop, so results are not cached.
+    """
+    log_message(
+        f"Using PP-OCRv5 (Korean) for text extraction"
+        if language == "korean"
+        else "Using PP-OCRv4 for text extraction",
+        verbose=debug,
+    )
+
+    pil_images = _prepare_images_for_ocr(images_b64, verbose=debug)
+    extracted_texts = [
+        " ".join(text.split())
+        if text and text != "[OCR FAILED]"
+        else (text or "[OCR FAILED]")
+        for text in extract_text_with_rapidocr(pil_images, verbose=debug, language=language)
+    ]
+
+    _format_ocr_results(extracted_texts, bubble_metadata)
+
+    total_elements = len(images_b64)
+    if len(extracted_texts) != total_elements:
+        log_message(
+            f"Warning: extracted_texts length ({len(extracted_texts)}) "
+            f"doesn't match total_elements ({total_elements})",
+            always_print=True,
+        )
+        extracted_texts = (
+            extracted_texts + ["[OCR FAILED]"] * total_elements
+        )[:total_elements]
+
+    if not extracted_texts or _check_ocr_failure(extracted_texts):
+        log_message("PP-OCR returned no usable text", verbose=debug)
+
+    return extracted_texts
+
+MAX_LLM_OCR_BATCH_SIZE = 8
+
+
 def _perform_llm_ocr(
     config: TranslationConfig,
     images_b64: list[str],
@@ -1666,20 +1977,66 @@ def _perform_llm_ocr(
     debug: bool = False,
     prompt_cache_key: str | None = None,
 ) -> list[str]:
-    """Perform OCR using vision LLM.
+    """Perform OCR using vision LLM in batches of at most MAX_LLM_OCR_BATCH_SIZE.
 
-    Args:
-        config: TranslationConfig
-        images_b64: List of base64-encoded images
-        mime_types: List of MIME types for each image
-        ocr_prompt: OCR prompt text
-        provider: Provider name
-        input_language: Input language
-        debug: Whether to print verbose logging
-
-    Returns:
-        List of extracted text strings, or early return with failure list
+    Batching avoids router HTTP 504 timeouts on pages with many bubbles (15-30+)
+    and prevents LLM sequence skipping / off-by-one errors.
     """
+    total_elements = len(images_b64)
+    if total_elements == 0:
+        return []
+
+    # If small enough, process directly
+    if total_elements <= MAX_LLM_OCR_BATCH_SIZE:
+        return _perform_llm_ocr_single_chunk(
+            config,
+            images_b64,
+            mime_types,
+            provider,
+            input_language,
+            debug,
+            prompt_cache_key=prompt_cache_key,
+        )
+
+    # Process in chunks
+    all_extracted_texts: list[str] = []
+    for chunk_start in range(0, total_elements, MAX_LLM_OCR_BATCH_SIZE):
+        chunk_end = min(chunk_start + MAX_LLM_OCR_BATCH_SIZE, total_elements)
+        chunk_b64 = images_b64[chunk_start:chunk_end]
+        chunk_mimes = mime_types[chunk_start:chunk_end]
+        chunk_size = chunk_end - chunk_start
+        log_message(
+            f"Processing LLM OCR batch {chunk_start + 1}-{chunk_end} of {total_elements}...",
+            always_print=True,
+        )
+        try:
+            chunk_results = _perform_llm_ocr_single_chunk(
+                config,
+                chunk_b64,
+                chunk_mimes,
+                provider,
+                input_language,
+                debug,
+                prompt_cache_key=prompt_cache_key,
+            )
+        except Exception as e:
+            log_message(f"LLM OCR batch {chunk_start + 1}-{chunk_end} failed: {e}", always_print=True)
+            chunk_results = [f"[OCR Error: {e}]"] * chunk_size
+        all_extracted_texts.extend(chunk_results)
+
+    return all_extracted_texts
+
+
+def _perform_llm_ocr_single_chunk(
+    config: TranslationConfig,
+    images_b64: list[str],
+    mime_types: list[str],
+    provider: str,
+    input_language: str | None,
+    debug: bool = False,
+    prompt_cache_key: str | None = None,
+) -> list[str]:
+    """Perform vision LLM OCR for a single chunk of images."""
     total_elements = len(images_b64)
     ocr_parts = []
     for i, img_b64 in enumerate(images_b64):
@@ -1693,6 +2050,14 @@ def _perform_llm_ocr(
                 bubble_part, config.media_resolution_bubbles
             )
         ocr_parts.append(bubble_part)
+
+    ocr_prompt = f"""
+## CONTEXT
+You have been provided with {total_elements} individual text images from a manga page.
+
+## TASK
+Transcribe the text in each image according to your transcription rules.
+"""
 
     ocr_system = _build_system_prompt_ocr(
         input_language,
@@ -1724,6 +2089,35 @@ def _perform_llm_ocr(
     return extracted_texts
 
 
+def perform_llm_ocr_on_images(
+    config: TranslationConfig,
+    images: list[Image.Image],
+    debug: bool = False,
+) -> list[str]:
+    """Run the vision-LLM OCR path on already-decoded PIL crops."""
+    images_b64: list[str] = []
+    mime_types: list[str] = []
+    for img in images:
+        buffer = BytesIO()
+        img.convert("RGB").save(buffer, format="PNG")
+        images_b64.append(base64.b64encode(buffer.getvalue()).decode("utf-8"))
+        mime_types.append("image/png")
+
+    prompt = (
+        f"## CONTEXT\nYou have been provided with {len(images_b64)} individual text "
+        "images from a manga page.\n\n## TASK\nTranscribe the text in each image "
+        "according to your transcription rules.\n"
+    )
+    return _perform_llm_ocr(
+        config,
+        images_b64,
+        mime_types,
+        prompt,
+        config.provider,
+        config.input_language,
+        debug,
+    )
+
 def call_translation_api_batch(
     config: TranslationConfig,
     images_b64: list[str],
@@ -1734,6 +2128,7 @@ def call_translation_api_batch(
     previous_context_images: list[dict[str, str]] | None = None,
     previous_context_texts: list[list[str]] | None = None,
     ocr_texts_output: list[str] | None = None,
+    pre_extracted_ocr_texts: list[str] | None = None,
     debug: bool = False,
 ) -> list[str]:
     """
@@ -1772,8 +2167,9 @@ def call_translation_api_batch(
     input_language = config.input_language
     output_language = config.output_language
     translation_mode = config.translation_mode
+    ocr_engine = resolve_ocr_engine(config.ocr_method, input_language)
     previous_context_images = previous_context_images or []
-    if not config.send_full_page_context or config.ocr_method != "LLM":
+    if not config.send_full_page_context or ocr_engine != "LLM":
         previous_context_images = []
     previous_context_image_count = len(previous_context_images)
     # Filter out empty pages (no usable OCR) and trim to configured cap so the
@@ -1876,8 +2272,12 @@ def call_translation_api_batch(
         base_parts.append(previous_part)
 
     try:
-        if translation_mode == "two-step":
-            ocr_prompt = f"""
+        if translation_mode == "two-step" or pre_extracted_ocr_texts is not None:
+            if pre_extracted_ocr_texts is not None and len(pre_extracted_ocr_texts) == total_elements:
+                log_message("Using pre-extracted OCR texts (skipping OCR scan step)", always_print=True)
+                extracted_texts = list(pre_extracted_ocr_texts)
+            else:
+                ocr_prompt = f"""
 ## CONTEXT
 You have been provided with {total_elements} individual text images from a manga page.
 
@@ -1885,30 +2285,54 @@ You have been provided with {total_elements} individual text images from a manga
 Transcribe the text in each image according to your transcription rules.
 """
 
-            log_message("Starting OCR step", verbose=debug)
+                log_message("Starting OCR step", verbose=debug)
 
-            if config.ocr_method == "manga-ocr":
-                extracted_texts = _perform_manga_ocr(
-                    images_b64,
-                    bubble_metadata,
-                    debug,
-                )
-            elif config.ocr_method == "paddleocr-vl-1.6":
-                extracted_texts = _perform_paddle_ocr_vl(
-                    images_b64,
-                    bubble_metadata,
-                    debug,
-                )
-            else:
-                extracted_texts = _perform_llm_ocr(
-                    config,
-                    images_b64,
-                    mime_types,
-                    ocr_prompt,
-                    provider,
-                    input_language,
-                    debug,
-                    prompt_cache_key=session_prompt_cache_key,
+                if ocr_engine == "manga-ocr":
+                    extracted_texts = _perform_manga_ocr(
+                        images_b64,
+                        bubble_metadata,
+                        debug,
+                    )
+                elif ocr_engine == "rapidocr":
+                    extracted_texts = _perform_rapidocr(
+                        images_b64,
+                        bubble_metadata,
+                        debug,
+                    )
+                elif ocr_engine == "rapidocr-korean":
+                    extracted_texts = _perform_rapidocr(
+                        images_b64,
+                        bubble_metadata,
+                        debug,
+                        language="korean",
+                    )
+                elif ocr_engine == "paddleocr-vl-1.6":
+                    extracted_texts = _perform_paddle_ocr_vl(
+                        images_b64,
+                        bubble_metadata,
+                        debug,
+                    )
+                else:
+                    extracted_texts = _perform_llm_ocr(
+                        config,
+                        images_b64,
+                        mime_types,
+                        ocr_prompt,
+                        provider,
+                        input_language,
+                        debug,
+                        prompt_cache_key=session_prompt_cache_key,
+                    )
+
+                # A refused/timed-out crop (safety filter, 504) leaves a hole,
+                # but the page's other items reveal the script. Retry just the
+                # holes with the matching offline engine.
+                extracted_texts = retry_failed_ocr_locally(
+                    _prepare_images_for_ocr(images_b64, verbose=debug),
+                    extracted_texts,
+                    source_language=input_language,
+                    primary_engine=ocr_engine,
+                    verbose=debug,
                 )
 
             log_message("Starting translation step", verbose=debug)
@@ -1931,7 +2355,7 @@ Transcribe the text in each image according to your transcription rules.
             full_page_context = (
                 "A full-page image is also provided for visual and narrative context."
                 if (
-                    config.ocr_method not in ("manga-ocr", "paddleocr-vl-1.6")
+                    ocr_engine not in ("manga-ocr", "paddleocr-vl-1.6", "rapidocr")
                     and config.send_full_page_context
                     and full_image_b64
                 )
@@ -1962,7 +2386,7 @@ The target language is {output_language}. Use the appropriate translation approa
 
             translation_parts = []
             if (
-                config.ocr_method not in ("manga-ocr", "paddleocr-vl-1.6")
+                ocr_engine not in ("manga-ocr", "paddleocr-vl-1.6", "rapidocr")
                 and config.send_full_page_context
                 and full_image_b64
             ):

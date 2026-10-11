@@ -397,9 +397,10 @@ def main():
         "--ocr-method",
         type=str,
         default="LLM",
-        choices=["LLM", "manga-ocr", "paddleocr-vl-1.6"],
+        choices=["LLM", "Auto", "manga-ocr", "paddleocr-vl-1.6", "rapidocr"],
         help=(
             "Determines whether to use a vision-capable LLM or a local OCR model for OCR. "
+            "'Auto' picks by source language. "
             "Local OCR options enable text-only LLMs for translation "
             "and must be used in 'two-step' translation mode."
         ),
@@ -570,6 +571,11 @@ def main():
         "--test-mode",
         action="store_true",
         help="Skip translation and render placeholder text (lorem ipsum)",
+    )
+    parser.add_argument(
+        "--mask-preview",
+        action="store_true",
+        help="Detect bubbles and OSB text to draw preview bounding boxes only; skip redraw and translation",
     )
     parser.add_argument(
         "--enable-web-search",
@@ -1050,7 +1056,10 @@ def main():
     # --- Validate mutually exclusive flags ---
     try:
         validate_mutually_exclusive_modes(
-            args.cleaning_only, args.upscaling_only, args.test_mode
+            args.cleaning_only,
+            args.upscaling_only,
+            args.test_mode,
+            args.mask_preview,
         )
     except Exception as e:
         parser.error(str(e))
@@ -1157,6 +1166,7 @@ def main():
         and not api_key
         and not args.cleaning_only
         and not args.test_mode
+        and not args.mask_preview
     ):
         log_message(
             f"Warning: {provider} API key not provided via {api_key_arg_name} or {api_key_env_var} "
@@ -1330,7 +1340,7 @@ def main():
                 if (
                     args.batch
                     and args.send_full_page_context
-                    and args.ocr_method == "LLM"
+                    and args.ocr_method in ("LLM", "Auto")
                 )
                 else 0
             ),
@@ -1425,6 +1435,7 @@ def main():
             auto_scale=args.auto_scale,
         ),
         test_mode=args.test_mode,
+        mask_preview_only=args.mask_preview,
     )
 
     clamp_settings(config)

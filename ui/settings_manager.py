@@ -230,6 +230,7 @@ DEFAULT_SETTINGS = {
     "cleaning_only": False,
     "upscaling_only": False,
     "test_mode": False,
+    "mask_preview_only": False,
     "reasoning_effort": None,  # Default: Google uses "auto", Anthropic uses "none", others use "high"
     "effort": "medium",  # Opus 4.5+, Sonnet 4.6 only: token spending eagerness (xhigh/high/medium/low)
     "verbosity": "low",  # GPT-5 series only: controls response verbosity (high/medium/low)
@@ -452,6 +453,7 @@ CANONICAL_CONFIG_KEY_ORDER: list[str] = [
     "cleaning_only",
     "upscaling_only",
     "test_mode",
+    "mask_preview_only",
     # Batch
     "batch_input_language",
     "batch_output_language",
@@ -777,6 +779,7 @@ def reset_to_defaults() -> dict[str, Any]:
     _apply_provider_sampling_defaults(settings, preserved_provider)
     settings["cleaning_only"] = DEFAULT_SETTINGS["cleaning_only"]
     settings["upscaling_only"] = DEFAULT_SETTINGS["upscaling_only"]
+    settings["mask_preview_only"] = DEFAULT_SETTINGS["mask_preview_only"]
     settings["translation_mode"] = DEFAULT_SETTINGS["translation_mode"]
 
     return settings

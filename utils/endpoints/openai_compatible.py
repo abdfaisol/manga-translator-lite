@@ -159,6 +159,7 @@ def call_openai_compatible_endpoint(
         "model": model_name,
         "messages": messages,
         "max_tokens": generation_config.get("max_tokens", 4096),
+        "stream": False,
     }
 
     is_openai_model = metadata.get("is_openai_model", False)

@@ -36,9 +36,12 @@ def init_file_logging(
         prev_log = target_dir / PREVIOUS_LOG_NAME
 
         if curr_log.exists():
-            if prev_log.exists():
-                prev_log.unlink()
-            curr_log.replace(prev_log)
+            try:
+                if prev_log.exists():
+                    prev_log.unlink()
+                curr_log.replace(prev_log)
+            except (PermissionError, OSError):
+                pass
 
         _log_file = open(curr_log, "a", encoding="utf-8")  # noqa: SIM115
         _log_initialized = True

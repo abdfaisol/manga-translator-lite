@@ -9,8 +9,17 @@ from typing import TYPE_CHECKING, Any, Optional
 from PIL import Image
 
 from core.config import MangaTranslatorConfig, RenderingConfig
-from core.pipeline import batch_translate_images, translate_and_render
-from core.validation import validate_batch_input_path, validate_core_inputs
+from core.pipeline import (
+    batch_translate_images,
+    simulate_full_pipeline,
+    simulate_mask_and_ocr,
+    translate_and_render,
+)
+from core.validation import (
+    autodetect_yolo_model_path,
+    validate_batch_input_path,
+    validate_core_inputs,
+)
 from utils.archive import safe_extract_zip
 from utils.exceptions import (
     CancellationError,
@@ -242,6 +251,96 @@ def translate_manga_logic(
         raise LogicError(
             f"An unexpected error occurred during translation: {e!s}"
         ) from e
+    finally:
+        if temp_image_path and temp_image_path.exists():
+            try:
+                os.remove(temp_image_path)
+            except Exception as e_clean:
+                log_message(
+                    f"Failed to clean up temporary file: {e_clean}", always_print=True
+                )
+
+
+def simulate_manga_logic(
+    image: str | Path | Image.Image,
+    config: MangaTranslatorConfig,
+    models_dir: Path,
+    run_ocr: bool = True,
+    cancellation_manager: Optional["CancellationManager"] = None,
+) -> tuple[Image.Image, list[tuple[Image.Image, str]], list[list[Any]], str, dict[str, Any]]:
+    """Detect masks, draw red boxes, and OCR each item without translating."""
+    if not models_dir.is_dir():
+        raise FileNotFoundError(f"YOLO models directory not found: {models_dir}")
+
+    config.yolo_model_path = str(
+        autodetect_yolo_model_path(models_dir, config.detection.bubble_detector_model)
+    )
+
+    temp_image_path = None
+    try:
+        if isinstance(image, (str, Path)):
+            image_path_for_processing = str(image)
+        elif isinstance(image, Image.Image):
+            temp_image_path = Path(tempfile.mktemp(suffix=".png"))
+            image.save(temp_image_path)
+            image_path_for_processing = str(temp_image_path)
+        else:
+            raise ValidationError("No valid image provided for simulation.")
+
+        return simulate_mask_and_ocr(
+            image_path=image_path_for_processing,
+            config=config,
+            run_ocr=run_ocr,
+            verbose=config.verbose,
+            cancellation_manager=cancellation_manager,
+        )
+    finally:
+        if temp_image_path and temp_image_path.exists():
+            try:
+                os.remove(temp_image_path)
+            except Exception as e_clean:
+                log_message(
+                    f"Failed to clean up temporary file: {e_clean}", always_print=True
+                )
+
+
+def simulate_translate_pipeline_logic(
+    image: str | Path | Image.Image,
+    config: MangaTranslatorConfig,
+    models_dir: Path,
+    cancellation_manager: Optional["CancellationManager"] = None,
+    pre_detected_items: Optional[list[dict[str, Any]]] = None,
+    pre_extracted_ocr_texts: Optional[list[str]] = None,
+    pre_outside_work: Optional[Any] = None,
+) -> tuple[Image.Image, Image.Image, list[list[Any]], str]:
+    """Run full translation, inpainting, and typesetting in simulation mode."""
+    if not models_dir.is_dir():
+        raise FileNotFoundError(f"YOLO models directory not found: {models_dir}")
+
+    config.yolo_model_path = str(
+        autodetect_yolo_model_path(models_dir, config.detection.bubble_detector_model)
+    )
+
+    temp_image_path = None
+    try:
+        if isinstance(image, (str, Path)):
+            image_path_for_processing = str(image)
+        elif isinstance(image, Image.Image):
+            temp_image_path = Path(tempfile.mktemp(suffix=".png"))
+            image.save(temp_image_path)
+            image_path_for_processing = str(temp_image_path)
+        else:
+            raise ValidationError("No valid image provided for simulation.")
+
+        return simulate_full_pipeline(
+            image_path=image_path_for_processing,
+            config=config,
+            verbose=config.verbose,
+            cancellation_manager=cancellation_manager,
+            pre_detected_items=pre_detected_items,
+            pre_extracted_ocr_texts=pre_extracted_ocr_texts,
+            pre_outside_work=pre_outside_work,
+        )
     finally:
         if temp_image_path and temp_image_path.exists():
             try:

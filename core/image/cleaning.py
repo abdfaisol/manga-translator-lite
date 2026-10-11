@@ -20,7 +20,7 @@ from utils.logging import log_message
 
 from .detection import detect_speech_bubbles
 from .image_utils import pil_to_cv2
-from .inpainting import FluxKleinInpainter, FluxKontextInpainter
+from .inpainting import FluxKleinInpainter, FluxKontextInpainter, lama_available, lama_inpaint
 
 # Cleaning parameters
 GRAYSCALE_MIDPOINT = 128  # Threshold for determining black vs white bubbles
@@ -965,7 +965,7 @@ def clean_speech_bubbles(
                                 )
                             except Exception as e:
                                 log_message(
-                                    f"Flux inpainting failed for bubble {bbox_tuple}: {e}; falling back to standard fill",
+                                    f"Flux inpainting failed for bubble {bbox_tuple}: {e}; will try LaMa redraw",
                                     always_print=True,
                                 )
                                 continue
@@ -1000,7 +1000,7 @@ def clean_speech_bubbles(
                     )
                 except Exception as e:
                     log_message(
-                        f"Flux inpainting aborted; falling back to standard fill: {e}",
+                        f"Flux inpainting aborted; will try LaMa redraw: {e}",
                         always_print=True,
                     )
                 finally:
@@ -1013,9 +1013,30 @@ def clean_speech_bubbles(
             elif colored_bubbles:
                 log_message(
                     "Colored bubbles detected but Flux inpainting skipped "
-                    "(missing Hugging Face token); falling back to standard fill",
+                    "(missing Hugging Face token); trying LaMa redraw",
                     always_print=True,
                 )
+
+        # Content-aware redraw (LaMa) for colored bubbles that Flux did not handle
+        # (no token / CPU / failure). Flat-fill looks wrong on gradient/shaded art.
+        redraw_targets = [
+            b
+            for b in processed_bubbles
+            if b.get("is_colored", False) and not b.get("inpainted", False)
+        ]
+        if redraw_targets and inpaint_colored_bubbles and lama_available():
+            pil_redraw = Image.fromarray(cv2.cvtColor(cleaned_image, cv2.COLOR_BGR2RGB))
+            for bubble_info in redraw_targets:
+                mask_bool = bubble_info["mask"].astype(bool)
+                result = lama_inpaint(pil_redraw, mask_bool, verbose=verbose)
+                if result is None:
+                    break
+                pil_redraw = result
+                bubble_info["inpainted"] = True
+                _resample_inpainted_bubble_color(pil_redraw, bubble_info, mask_bool)
+            cleaned_image = cv2.cvtColor(
+                np.array(pil_redraw.convert("RGB")), cv2.COLOR_RGB2BGR
+            )
 
         # Group masks by color for efficient batch processing (skip already inpainted regions)
         if processed_bubbles:

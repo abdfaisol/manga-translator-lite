@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -19,6 +21,56 @@ TEXT_FREE_BUBBLE_IOA_THRESHOLD = (
     0.5  # Bubble treated as text_free only with substantial overlap
 )
 
+# OSB Region Splitting (recovers stacked text blocks the detector merged)
+OSB_SPLIT_MIN_GAP_PX = 6
+OSB_SPLIT_MIN_GAP_FACTOR = 0.6
+OSB_SPLIT_MIN_PART_PX = 8
+OSB_SPLIT_MIN_PART_RATIO = 0.15
+
+def _split_osb_box_by_row_gaps(bbox, gray: np.ndarray, max_depth: int = 3) -> list[list[int]]:
+    x1, y1, x2, y2 = [int(c) for c in bbox]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2 = max(x1 + 1, min(gray.shape[1], x2))
+    y2 = max(y1 + 1, min(gray.shape[0], y2))
+    crop_h = y2 - y1
+    crop_w = x2 - x1
+    if crop_h < 50 or max_depth <= 0:
+        return [[x1, y1, x2, y2]]
+
+    crop = gray[y1:y2, x1:x2]
+    row_std = crop.astype(np.float32).std(axis=1)
+    ink_level = float(np.percentile(row_std, 90))
+    if ink_level <= 5.0:
+        return [[x1, y1, x2, y2]]
+
+    # Empty rows have low standard deviation relative to text ink
+    empty = row_std < max(2.0, ink_level * 0.30)
+
+    # Minimum gap to consider as separation between distinct stacked text blocks:
+    # 25px or 40% of box width (whichever is larger), but at least 20px.
+    min_gap = max(20, min(int(crop_w * 0.4), 40))
+    min_part = max(25, int(crop_h * 0.15))
+
+    splits = []
+    run_start = None
+    for i, is_empty in enumerate(empty):
+        if is_empty:
+            if run_start is None:
+                run_start = i
+        elif run_start is not None:
+            # We don't split if the empty run touches the very top or bottom edge of the box
+            if run_start > min_part and (i - run_start) >= min_gap and (crop_h - i) >= min_part:
+                splits.append((run_start + i) // 2)
+            run_start = None
+
+    if not splits:
+        return [[x1, y1, x2, y2]]
+
+    bounds = [0, *splits, crop_h]
+    parts = []
+    for a, b in zip(bounds, bounds[1:]):
+        parts.extend(_split_osb_box_by_row_gaps([x1, y1 + a, x2, y1 + b], gray, max_depth - 1))
+    return parts
 
 class OutsideTextDetector:
     """Detects text outside speech bubbles to isolate SFX/captions from dialogue."""
@@ -482,6 +534,20 @@ class OutsideTextDetector:
 
         final_results = list(base_results)
 
+        if final_results:
+            gray_img = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
+            split_results = []
+            for bbox, conf in final_results:
+                sub_boxes = _split_osb_box_by_row_gaps(bbox, gray_img)
+                for sb in sub_boxes:
+                    split_results.append((sb, conf))
+            if len(split_results) > len(final_results):
+                log_message(
+                    f"Split {len(final_results)} OSB box(es) into {len(split_results)} at row gaps",
+                    verbose=verbose,
+                )
+            final_results = split_results
+
         log_message("Filtering out nested detections...", verbose=verbose)
         before_nested_filter = len(final_results)
         final_results = self.filter_nested_detections(final_results)
@@ -864,6 +930,96 @@ def extract_text_with_manga_ocr(
         log_message(f"Error with manga-ocr: {e}", always_print=True)
         return ["[OCR FAILED]"] * len(images)
 
+
+_RAPIDOCR_MODEL_DIR = Path(__file__).resolve().parents[2] / "models" / "rapidocr"
+_rapidocr_engines: dict[str, Any] = {}
+
+def _get_rapidocr_engine(language: str = "chinese"):
+    """Lazily create a PP-OCR ONNX engine (~15 MB, CPU-friendly).
+
+    "chinese" is the recogniser shipped with rapidocr_onnxruntime (Hanzi +
+    ASCII Latin). "korean" swaps in the PP-OCRv5 Korean recogniser kept in
+    models/rapidocr/, so Hangul pages have an offline fallback too.
+    """
+    if language not in _rapidocr_engines:
+        from rapidocr_onnxruntime import RapidOCR
+
+        if language == "korean":
+            rec_model = _RAPIDOCR_MODEL_DIR / "korean_rec.onnx"
+            rec_keys = _RAPIDOCR_MODEL_DIR / "korean_dict.txt"
+            if not (rec_model.exists() and rec_keys.exists()):
+                raise FileNotFoundError(
+                    f"Korean OCR model missing: expected {rec_model} and {rec_keys}"
+                )
+            _rapidocr_engines[language] = RapidOCR(
+                rec_model_path=str(rec_model), rec_keys_path=str(rec_keys)
+            )
+        else:
+            _rapidocr_engines[language] = RapidOCR()
+    return _rapidocr_engines[language]
+
+def extract_text_with_rapidocr(
+    images: list[Image.Image], verbose: bool = False, language: str | None = None
+) -> list[str]:
+    """Extract text from images using PP-OCR (ONNX).
+
+    The default dictionary covers Chinese, ASCII Latin and shared Hanzi.
+    language="korean" uses the PP-OCRv5 Korean dictionary instead, which covers
+    Hangul plus Latin. Kana and accented Latin are outside both - use manga-ocr
+    or a vision LLM for those.
+
+    Args:
+        images: List of PIL Images to process (RGB)
+        verbose: Whether to print verbose output
+        language: "chinese" (default) or "korean"
+
+    Returns:
+        List of extracted text strings (one per image). Returns [OCR FAILED] on errors.
+    """
+    if not images:
+        return []
+
+    engine_label = "PP-OCRv5 (Korean)" if language == "korean" else "PP-OCRv4"
+
+    try:
+        engine = _get_rapidocr_engine(language or "chinese")
+    except ImportError as e:
+        log_message(
+            f"rapidocr_onnxruntime unavailable ({e}); install it with "
+            "'pip install rapidocr_onnxruntime'",
+            always_print=True,
+        )
+        return ["[OCR FAILED]"] * len(images)
+    except OSError as e:
+        log_message(f"{engine_label} unavailable: {e}", always_print=True)
+        return ["[OCR FAILED]"] * len(images)
+
+    extracted_texts = []
+    for i, img in enumerate(images):
+        try:
+            if img is None:
+                log_message(
+                    f"Image {i + 1} is None (decode failure), skipping",
+                    always_print=True,
+                )
+                extracted_texts.append("[OCR FAILED]")
+                continue
+
+            log_message(
+                f"Processing image {i + 1}/{len(images)} with {engine_label}",
+                verbose=verbose,
+            )
+            result, _ = engine(np.array(img.convert("RGB")))
+            lines = [item[1] for item in (result or []) if item[1]]
+            extracted_texts.append("\n".join(lines))
+
+        except Exception as e:
+            log_message(
+                f"{engine_label} failed for image {i + 1}: {e}", always_print=True
+            )
+            extracted_texts.append("[OCR FAILED]")
+
+    return extracted_texts
 
 def _get_image_size_value(size_config, key: str):
     if isinstance(size_config, dict):

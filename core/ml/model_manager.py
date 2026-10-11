@@ -22,6 +22,18 @@ from ultralytics import YOLO
 
 from core.device import empty_cache, get_best_device, get_best_dtype, get_device_info
 from core.ml.rtdetr_adapter import RTDetrYOLOAdapter
+
+
+def _enable_offload(pipeline, low_vram: bool, verbose: bool = False) -> None:
+    """Enable CPU offload, or skip it on CPU-only machines (no accelerator)."""
+    if get_best_device().type == "cpu":
+        # ponytail: diffusers offload APIs require an accelerator; pipeline already on CPU.
+        log_message("No accelerator found; running pipeline on CPU.", verbose=verbose)
+    elif low_vram:
+        log_message("Using sequential CPU offload (low VRAM mode)...", verbose=verbose)
+        pipeline.enable_sequential_cpu_offload()
+    else:
+        pipeline.enable_model_cpu_offload()
 from core.ml.sdcpp_server import SDCppServerManager
 from utils.exceptions import ModelError
 from utils.logging import log_message
@@ -1251,14 +1263,11 @@ class ModelManager:
                     use_quantized_matmul=use_quantized_matmul,
                 )
 
-                if low_vram:
-                    log_message(
-                        "Using sequential CPU offload (low VRAM mode)...",
-                        verbose=verbose,
-                    )
-                    pipeline.enable_sequential_cpu_offload()
-                else:
-                    pipeline.enable_model_cpu_offload()
+                _enable_offload(
+                    pipeline, 
+                    low_vram, 
+                    verbose=verbose
+                )
 
                 self.models[ModelType.FLUX_KONTEXT_SDNQ_PIPELINE] = pipeline
                 log_message(
@@ -1345,14 +1354,11 @@ class ModelManager:
                     use_quantized_matmul=use_quantized_matmul,
                 )
 
-                if low_vram:
-                    log_message(
-                        "Using sequential CPU offload (low VRAM mode)...",
-                        verbose=verbose,
-                    )
-                    pipeline.enable_sequential_cpu_offload()
-                else:
-                    pipeline.enable_model_cpu_offload()
+                _enable_offload(
+                    pipeline, 
+                    low_vram, 
+                    verbose=verbose
+                )
 
                 self.models[model_type] = pipeline
                 log_message(

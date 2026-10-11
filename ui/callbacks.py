@@ -151,6 +151,7 @@ def _build_ui_state_from_args(args: tuple, is_batch: bool) -> UIConfigState:
         cleaning_only_toggle,
         upscaling_only_val,
         test_mode_toggle,
+        mask_preview_only_val,
         enable_web_search_val,
         enable_code_execution_val,
         image_detail_val,
@@ -409,6 +410,7 @@ def _build_ui_state_from_args(args: tuple, is_batch: bool) -> UIConfigState:
             cleaning_only=cleaning_only_toggle,
             upscaling_only=upscaling_only_val,
             test_mode=test_mode_toggle,
+            mask_preview_only=mask_preview_only_val,
             enable_web_search=enable_web_search_val,
             enable_code_execution=enable_code_execution_val,
             use_custom_sampling=use_custom_sampling_val,
@@ -444,15 +446,17 @@ def _validate_ui_state(ui_state: UIConfigState) -> None:
             ui_state.general.cleaning_only,
             ui_state.general.upscaling_only,
             ui_state.general.test_mode,
+            ui_state.general.mask_preview_only,
         )
     except ValidationError as e:
         raise gr.Error(f"{ERROR_PREFIX}{e!s}")
 
-    # Skip API key validation if in cleaning-only, upscaling-only, or test mode
+    # Skip API key validation if in cleaning-only, upscaling-only, test, or mask-preview mode
     if (
         not ui_state.general.cleaning_only
         and not ui_state.general.upscaling_only
         and not ui_state.general.test_mode
+        and not ui_state.general.mask_preview_only
     ):
         api_key_to_validate = ""
         provider_selector = ui_state.provider_settings.provider
@@ -496,6 +500,7 @@ def _validate_ui_state(ui_state: UIConfigState) -> None:
         and not ui_state.general.cleaning_only
         and not ui_state.general.upscaling_only
         and not ui_state.general.test_mode
+        and not ui_state.general.mask_preview_only
     ):
         if not ui_state.provider_settings.openai_compatible_url:
             raise gr.Error(f"{ERROR_PREFIX}OpenAI-Compatible URL is required.")
@@ -556,6 +561,8 @@ def _format_single_success_message(
         processing_mode_str = "Cleaning Only"
     elif backend_config.upscaling_only:
         processing_mode_str = "Upscaling Only"
+    elif getattr(backend_config, "mask_preview_only", False):
+        processing_mode_str = "Mask Preview"
     else:
         processing_mode_str = "Translation"
 
@@ -565,6 +572,8 @@ def _format_single_success_message(
         model_display = "<Cleaning-only Mode>"
     elif backend_config.upscaling_only:
         model_display = "<Upscaling-only Mode>"
+    elif getattr(backend_config, "mask_preview_only", False):
+        model_display = "<Mask Preview Mode>"
     else:
         model_display = f"{model_name}{thinking_status_str}"
 
@@ -731,6 +740,8 @@ def _format_batch_success_message(
         processing_mode_str = "Cleaning Only"
     elif backend_config.upscaling_only:
         processing_mode_str = "Upscaling Only"
+    elif getattr(backend_config, "mask_preview_only", False):
+        processing_mode_str = "Mask Preview"
     else:
         processing_mode_str = "Translation"
 
@@ -741,6 +752,8 @@ def _format_batch_success_message(
         model_display = "<Cleaning-only Mode>"
     elif backend_config.upscaling_only:
         model_display = "<Upscaling-only Mode>"
+    elif getattr(backend_config, "mask_preview_only", False):
+        model_display = "<Mask Preview Mode>"
     else:
         model_display = f"{model_name}{thinking_status_str}"
 
@@ -935,6 +948,151 @@ def handle_translate_click(
         cleaned = _clean_error_message(f"An unexpected error occurred: {e!s}")
         gr.Error(cleaned)
         return None, _status_update(cleaned)
+
+
+
+
+def handle_simulate_click(
+    *args: Any,
+    models_dir: Path,
+    fonts_base_dir: Path,
+    target_device: torch.device | None,
+) -> tuple[Image.Image | None, list[Any], list[list[Any]], str, dict[str, Any]]:
+    """Callback for the 'Run Simulation' button."""
+    input_image_path = args[0]
+    run_ocr = bool(args[1])
+    global CANCELLATION_MANAGER
+    CANCELLATION_MANAGER = CancellationManager()
+    try:
+        img_valid, img_msg = utils.validate_image(input_image_path)
+        if not img_valid:
+            raise gr.Error(f"{ERROR_PREFIX}{img_msg}")
+
+        ui_state = _build_ui_state_from_args(args[2:], is_batch=False)
+        backend_config = map_ui_to_backend_config(
+            ui_state=ui_state,
+            fonts_base_dir=fonts_base_dir,
+            target_device=target_device,
+            is_batch=False,
+        )
+
+        annotated_image, gallery_items, table_rows, status_msg, sim_cache = logic.simulate_manga_logic(
+            image=input_image_path,
+            config=backend_config,
+            models_dir=models_dir,
+            run_ocr=run_ocr,
+            cancellation_manager=CANCELLATION_MANAGER,
+        )
+        return annotated_image, gallery_items, table_rows, _status_update(status_msg), sim_cache
+
+    except gr.Error as e:
+        cleaned = _clean_error_message(e)
+        gr.Error(cleaned)
+        return None, [], [], _status_update(cleaned), {}
+    except CancellationError:
+        return None, [], [], _status_update("Simulation cancelled."), {}
+    except (ValidationError, FileNotFoundError, ValueError, logic.LogicError) as e:
+        cleaned = _clean_error_message(e)
+        gr.Error(cleaned)
+        return None, [], [], _status_update(cleaned), {}
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        cleaned = _clean_error_message(f"An unexpected error occurred during simulation: {e!s}")
+        gr.Error(cleaned)
+        return None, [], [], _status_update(cleaned), {}
+
+
+def update_sim_buttons(processing: bool):
+    """Toggle simulation run and clear buttons."""
+    global CANCELLATION_MANAGER
+    if not processing:
+        CANCELLATION_MANAGER = None
+    return (
+        gr.update(
+            interactive=not processing,
+            value="Simulating..." if processing else "Run Simulation",
+        ),
+        gr.update(interactive=not processing),
+    )
+
+
+def handle_simulate_translate_click(
+    *args: Any,
+    models_dir: Path,
+    fonts_base_dir: Path,
+    target_device: torch.device | None,
+) -> tuple[Image.Image | None, Image.Image | None, list[list[Any]], str]:
+    """Callback for the 'Simulasi Translate (Full)' button."""
+    input_image_path = args[0]
+    sim_cache = args[1] if isinstance(args[1], dict) else {}
+    global CANCELLATION_MANAGER
+    CANCELLATION_MANAGER = CancellationManager()
+    try:
+        img_valid, img_msg = utils.validate_image(input_image_path)
+        if not img_valid:
+            raise gr.Error(f"{ERROR_PREFIX}{img_msg}")
+
+        ui_state = _build_ui_state_from_args(args[2:], is_batch=False)
+        backend_config = map_ui_to_backend_config(
+            ui_state=ui_state,
+            fonts_base_dir=fonts_base_dir,
+            target_device=target_device,
+            is_batch=False,
+        )
+
+        pre_detected_items = sim_cache.get("sorted_items") if isinstance(sim_cache, dict) else None
+        pre_extracted_ocr_texts = sim_cache.get("ocr_texts") if isinstance(sim_cache, dict) else None
+        pre_outside_work = sim_cache.get("outside_work") if isinstance(sim_cache, dict) else None
+        if pre_extracted_ocr_texts and all(t == "(OCR skipped)" for t in pre_extracted_ocr_texts):
+            pre_extracted_ocr_texts = None
+
+        # Ensure cleaning_only is False during translation simulation so translation is performed
+        backend_config.cleaning_only = False
+
+        cleaned_img, final_img, table_rows, status_msg = logic.simulate_translate_pipeline_logic(
+            image=input_image_path,
+            config=backend_config,
+            models_dir=models_dir,
+            cancellation_manager=CANCELLATION_MANAGER,
+            pre_detected_items=pre_detected_items,
+            pre_extracted_ocr_texts=pre_extracted_ocr_texts,
+            pre_outside_work=pre_outside_work,
+        )
+        return cleaned_img, final_img, table_rows, _status_update(status_msg)
+
+    except gr.Error as e:
+        cleaned = _clean_error_message(e)
+        gr.Error(cleaned)
+        return None, None, [], _status_update(cleaned)
+    except CancellationError:
+        return None, None, [], _status_update("Simulation cancelled.")
+    except (ValidationError, FileNotFoundError, ValueError, logic.LogicError) as e:
+        cleaned = _clean_error_message(e)
+        gr.Error(cleaned)
+        return None, None, [], _status_update(cleaned)
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        cleaned = _clean_error_message(f"An unexpected error occurred during simulation translation: {e!s}")
+        gr.Error(cleaned)
+        return None, None, [], _status_update(cleaned)
+
+
+def update_sim_translate_buttons(processing: bool):
+    """Toggle full simulation translate button."""
+    global CANCELLATION_MANAGER
+    if not processing:
+        CANCELLATION_MANAGER = None
+    return (
+        gr.update(
+            interactive=not processing,
+            value="Translating..." if processing else "Simulasi Translate",
+        ),
+        gr.update(interactive=not processing),
+    )
 
 
 def handle_zip_or_failed_paths_upload(
@@ -1148,6 +1306,7 @@ def handle_save_config_click(*args: Any) -> str:
         cleaning_only_val,
         upscaling_only_val,
         test_mode_val,
+        mask_preview_only_val,
         s_in_lang,
         s_out_lang,
         s_font,
@@ -1395,6 +1554,7 @@ def handle_save_config_click(*args: Any) -> str:
             cleaning_only=cleaning_only_val,
             upscaling_only=upscaling_only_val,
             test_mode=test_mode_val,
+            mask_preview_only=mask_preview_only_val,
             enable_web_search=enable_web_search_val,
             enable_code_execution=enable_code_execution_val,
             use_custom_sampling=use_custom_sampling_val,
@@ -1675,6 +1835,7 @@ def handle_reset_defaults_click(fonts_base_dir: Path) -> list[gr.update]:
         default_ui_state.general.cleaning_only,
         default_ui_state.general.upscaling_only,
         default_ui_state.general.test_mode,
+        default_ui_state.general.mask_preview_only,
         default_ui_state.input_language,
         default_ui_state.output_language,
         gr.update(value=default_ui_state.font_pack),
@@ -2060,35 +2221,32 @@ def handle_hyphenation_change(
 
 
 def handle_cleaning_only_change(cleaning_only: bool):
-    """Handles changes in the cleaning-only checkbox to disable upscaling-only and test mode if enabled."""
-    return (
-        gr.update(
-            interactive=not cleaning_only, value=False if cleaning_only else None
-        ),
-        gr.update(
-            interactive=not cleaning_only, value=False if cleaning_only else None
-        ),
+    """Handles changes in the cleaning-only checkbox to disable other exclusive modes if enabled."""
+    off = gr.update(
+        interactive=not cleaning_only, value=False if cleaning_only else None
     )
+    return (off, off, off)
 
 
 def handle_upscaling_only_change(upscaling_only: bool):
-    """Handles changes in the upscaling-only checkbox to disable cleaning-only and test mode if enabled."""
-    return (
-        gr.update(
-            interactive=not upscaling_only, value=False if upscaling_only else None
-        ),
-        gr.update(
-            interactive=not upscaling_only, value=False if upscaling_only else None
-        ),
+    """Handles changes in the upscaling-only checkbox to disable other exclusive modes if enabled."""
+    off = gr.update(
+        interactive=not upscaling_only, value=False if upscaling_only else None
     )
+    return (off, off, off)
 
 
 def handle_test_mode_change(test_mode: bool):
-    """Handles changes in the test mode checkbox to disable cleaning-only and upscaling-only if enabled."""
-    return (
-        gr.update(interactive=not test_mode, value=False if test_mode else None),
-        gr.update(interactive=not test_mode, value=False if test_mode else None),
+    """Handles changes in the test mode checkbox to disable other exclusive modes if enabled."""
+    off = gr.update(interactive=not test_mode, value=False if test_mode else None)
+    return (off, off, off)
+
+def handle_mask_preview_only_change(mask_preview_only: bool):
+    """Handles changes in the mask preview checkbox to disable other exclusive modes if enabled."""
+    off = gr.update(
+        interactive=not mask_preview_only, value=False if mask_preview_only else None
     )
+    return (off, off, off)
 
 
 def handle_conjoined_detection_change(_conjoined_detection: bool):
@@ -2601,7 +2759,7 @@ def handle_translation_mode_change(translation_mode: str, current_ocr_method: st
 
     is_two_step = translation_mode == "two-step"
     if translation_mode == "one-step":
-        if current_ocr_method in ("manga-ocr", "paddleocr-vl-1.6"):
+        if current_ocr_method in ("manga-ocr", "paddleocr-vl-1.6", "rapidocr", "Auto"):
             ocr_update = gr.update(value="LLM", interactive=False)
         else:
             ocr_update = gr.update(interactive=False)

@@ -1560,12 +1560,12 @@ def fetch_and_update_openrouter_models(
             output_modalities = []
         output_modalities_lc = [str(m).lower() for m in output_modalities]
 
-        if ocr_method in ("manga-ocr", "paddleocr-vl-1.6"):
+        if ocr_method in ("manga-ocr", "paddleocr-vl-1.6", "rapidocr"):
             # For local OCR: require text input and text output
             if "text" in input_modalities_lc and "text" in output_modalities_lc:
                 filtered_models.append(model["id"])
         else:
-            # For LLM OCR: require vision capability (image input + text output)
+            # For LLM / Auto OCR: require vision capability (image input + text output)
             if "image" in input_modalities_lc and "text" in output_modalities_lc:
                 filtered_models.append(model["id"])
 
@@ -1793,7 +1793,7 @@ def fetch_and_update_opencode_models(
             gr.Warning(f"Error fetching OpenCode models from {url}: {e}")
             return gr.update(choices=[], value=None)
 
-    if ocr_method == "LLM":
+    if ocr_method in ("LLM", "Auto"):
         filtered_models = [m for m in models if is_opencode_multimodal_model(m)]
     else:
         filtered_models = list(models)

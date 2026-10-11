@@ -296,24 +296,29 @@ def validate_core_inputs(
 
 
 def validate_mutually_exclusive_modes(
-    cleaning_only: bool, upscaling_only: bool, test_mode: bool
+    cleaning_only: bool,
+    upscaling_only: bool,
+    test_mode: bool,
+    mask_preview_only: bool = False,
 ) -> None:
     """
-    Validates that cleaning_only, upscaling_only, and test_mode are mutually exclusive.
+    Validates that cleaning_only, upscaling_only, test_mode, and mask_preview_only
+    are mutually exclusive.
 
     Args:
         cleaning_only (bool): Whether cleaning-only mode is enabled.
         upscaling_only (bool): Whether upscaling-only mode is enabled.
         test_mode (bool): Whether test mode is enabled.
+        mask_preview_only (bool): Whether mask-preview-only mode is enabled.
 
     Raises:
         ValidationError: If more than one mode is enabled simultaneously.
     """
-    enabled_modes = sum([cleaning_only, upscaling_only, test_mode])
+    enabled_modes = sum([cleaning_only, upscaling_only, test_mode, mask_preview_only])
     if enabled_modes > 1:
         raise ValidationError(
-            "Cleaning-only mode, Upscaling-only mode, and Test mode are mutually exclusive. "
-            "Only one mode can be active at a time."
+            "Cleaning-only mode, Upscaling-only mode, Test mode, and Mask Preview mode "
+            "are mutually exclusive. Only one mode can be active at a time."
         )
 
 
@@ -328,7 +333,10 @@ def validate_config(config: MangaTranslatorConfig) -> None:
         ValidationError: If invalid configuration is detected.
     """
     validate_mutually_exclusive_modes(
-        config.cleaning_only, config.upscaling_only, config.test_mode
+        config.cleaning_only,
+        config.upscaling_only,
+        config.test_mode,
+        config.mask_preview_only,
     )
     if (
         config.outside_text.inpainting_method in ("flux_klein_9b", "flux_klein_4b")

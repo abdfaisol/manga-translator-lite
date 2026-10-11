@@ -1307,8 +1307,9 @@ def detect_speech_bubbles(
             if image_cv is None:
                 raise ImageProcessingError(f"Could not read image at {image_path}")
             image_pil = Image.fromarray(cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB))
+        img_name = Path(image_path).name if image_path else "override"
         log_message(
-            f"Processing image: {image_path.name} ({image_cv.shape[1]}x{image_cv.shape[0]})",
+            f"Processing image: {img_name} ({image_cv.shape[1]}x{image_cv.shape[0]})",
             verbose=verbose,
         )
     except Exception as e:
@@ -1844,8 +1845,9 @@ def detect_panels(
             if image_cv is None:
                 raise ImageProcessingError(f"Could not read image at {image_path}")
             image_pil = Image.fromarray(cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB))
+        panel_img_name = Path(image_path).name if image_path else "override"
         log_message(
-            f"Processing image for panel detection: {image_path.name if image_path else 'override'} "
+            f"Processing image for panel detection: {panel_img_name} "
             f"({image_cv.shape[1]}x{image_cv.shape[0]})",
             verbose=verbose,
         )

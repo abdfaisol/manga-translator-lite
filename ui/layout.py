@@ -428,6 +428,93 @@ def create_layout(
                                 "Cancel", variant="stop", visible=False
                             )
 
+            with gr.TabItem("Simulasi"):  # noqa: SIM117
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        sim_input_image = gr.Image(
+                            type="filepath",
+                            label="Upload Image",
+                            show_download_button=False,
+                            image_mode=None,
+                            elem_id="simulation_input_image",
+                        )
+                        sim_run_ocr = gr.Checkbox(
+                            label="Run OCR",
+                            value=True,
+                            info=(
+                                "Extract text for each detected mask/bubble. The engine follows "
+                                "Source Language: manga-ocr for Japanese, PP-OCRv5 Korean for "
+                                "Korean, PP-OCRv4 for Chinese/English, LLM vision for anything "
+                                "else (including Auto)."
+                            ),
+                            elem_id="simulation_run_ocr",
+                        )
+                        with gr.Row():
+                            sim_source_language = gr.Dropdown(
+                                ["Auto"] + SOURCE_LANGUAGES,
+                                label="Source Language",
+                                value=saved_settings.get("input_language", "Japanese"),
+                                allow_custom_value=True,
+                                info="Auto = biarkan model mendeteksi bahasanya sendiri. Hanya berlaku untuk tab Simulasi.",
+                                elem_id="simulation_source_language",
+                            )
+                            sim_target_language = gr.Dropdown(
+                                TARGET_LANGUAGES,
+                                label="Target Language",
+                                value=saved_settings.get("output_language", "English"),
+                                allow_custom_value=True,
+                                info="Bahasa hasil terjemahan. Hanya berlaku untuk tab Simulasi.",
+                                elem_id="simulation_target_language",
+                            )
+                        with gr.Row():
+                            sim_run_button = gr.Button("1. Deteksi & Mask (Kotak Merah)", variant="primary")
+                            sim_translate_button = gr.Button("2. Lanjut Simulasi Translate", variant="secondary")
+                            sim_clear_button = gr.Button("Clear")
+                        sim_status_message = gr.Textbox(
+                            label="Simulation Status",
+                            interactive=False,
+                            elem_id="simulation_status_message",
+                        )
+                        sim_dataframe = gr.Dataframe(
+                            headers=["#", "Type", "BBox", "OCR Text", "Translation"],
+                            datatype=["number", "str", "str", "str", "str"],
+                            interactive=False,
+                            label="Daftar Teks & Hasil Translasi",
+                            elem_id="simulation_dataframe",
+                        )
+                    with gr.Column(scale=1):
+                        with gr.Tabs():
+                            with gr.TabItem("1. Mask / Kotak Merah"):
+                                sim_annotated_image = gr.Image(
+                                    type="pil",
+                                    label="Area Mask / OCR (Kotak Merah)",
+                                    interactive=False,
+                                    elem_id="simulation_annotated_image",
+                                )
+                            with gr.TabItem("2. Hasil Redraw / Cleaning"):
+                                sim_cleaned_image = gr.Image(
+                                    type="pil",
+                                    label="Hasil Redraw / Inpainting (Cleaning)",
+                                    interactive=False,
+                                    elem_id="simulation_cleaned_image",
+                                )
+                            with gr.TabItem("3. Hasil Final Typesetting"):
+                                sim_typeset_image = gr.Image(
+                                    type="pil",
+                                    label="Hasil Final Typesetting",
+                                    interactive=False,
+                                    elem_id="simulation_typeset_image",
+                                )
+                        sim_gallery = gr.Gallery(
+                            label="Per-Item Crop & OCR",
+                            show_label=True,
+                            elem_id="simulation_gallery",
+                            columns=2,
+                            rows=2,
+                            height="auto",
+                            preview=True,
+                        )
+
             with gr.TabItem("Batch"):  # noqa: SIM117
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -796,11 +883,20 @@ def create_layout(
                                 ),
                             )
                             ocr_method_radio = gr.Radio(
-                                choices=["LLM", "manga-ocr", "paddleocr-vl-1.6"],
+                                choices=[
+                                    "LLM",
+                                    "Auto",
+                                    "manga-ocr",
+                                    "paddleocr-vl-1.6",
+                                    "rapidocr",
+                                ],
                                 label="OCR Method",
                                 value=initial_ocr_method,
                                 info=(
                                     "Determines whether to use a vision-capable LLM or a local OCR model for OCR. "
+                                    "'Auto' picks by Source Language: manga-ocr for Japanese, "
+                                    "PP-OCRv5 Korean for Korean, PP-OCRv4 for Chinese/English, "
+                                    "LLM vision for anything else. "
                                     "Local OCR options enable text-only LLMs for translation "
                                     "and must be used in 'two-step' translation mode."
                                 ),
@@ -2440,6 +2536,19 @@ def create_layout(
                                 interactive=not (
                                     saved_settings.get("cleaning_only", False)
                                     or saved_settings.get("upscaling_only", False)
+                                    or saved_settings.get("mask_preview_only", False)
+                                ),
+                            )
+                            mask_preview_only_toggle = gr.Checkbox(
+                                value=saved_settings.get("mask_preview_only", False),
+                                label="Mask Preview Mode",
+                                info=(
+                                    "Detect bubbles and OSB text to draw preview bounding boxes only; skip redraw and translation."
+                                ),
+                                interactive=not (
+                                    saved_settings.get("cleaning_only", False)
+                                    or saved_settings.get("upscaling_only", False)
+                                    or saved_settings.get("test_mode", False)
                                 ),
                             )
                         setting_groups.append(group_other)
@@ -2498,6 +2607,7 @@ def create_layout(
             cleaning_only_toggle,
             upscaling_only_toggle,
             test_mode_toggle,
+            mask_preview_only_toggle,
             input_language,
             output_language,
             font_dropdown,
@@ -2642,6 +2752,7 @@ def create_layout(
             cleaning_only_toggle,
             upscaling_only_toggle,
             test_mode_toggle,
+            mask_preview_only_toggle,
             input_language,
             output_language,
             font_dropdown,
@@ -2791,6 +2902,7 @@ def create_layout(
             cleaning_only_toggle,
             upscaling_only_toggle,
             test_mode_toggle,
+            mask_preview_only_toggle,
             enable_web_search_checkbox,
             enable_code_execution_checkbox,
             image_detail_dropdown,
@@ -2937,6 +3049,7 @@ def create_layout(
             cleaning_only_toggle,
             upscaling_only_toggle,
             test_mode_toggle,
+            mask_preview_only_toggle,
             enable_web_search_checkbox,
             enable_code_execution_checkbox,
             image_detail_dropdown,
@@ -3307,11 +3420,11 @@ def create_layout(
             queue=False,
         )
 
-        # Cleaning-only, Upscaling-only, and Test mode mutual exclusivity handlers
+        # Cleaning-only, Upscaling-only, Test mode, and Mask preview mutual exclusivity handlers
         cleaning_only_toggle.change(
             fn=callbacks.handle_cleaning_only_change,
             inputs=cleaning_only_toggle,
-            outputs=[upscaling_only_toggle, test_mode_toggle],
+            outputs=[upscaling_only_toggle, test_mode_toggle, mask_preview_only_toggle],
             queue=False,
         )
 
@@ -3319,7 +3432,7 @@ def create_layout(
         upscaling_only_toggle.change(
             fn=callbacks.handle_upscaling_only_change,
             inputs=upscaling_only_toggle,
-            outputs=[cleaning_only_toggle, test_mode_toggle],
+            outputs=[cleaning_only_toggle, test_mode_toggle, mask_preview_only_toggle],
             queue=False,
         )
 
@@ -3327,7 +3440,15 @@ def create_layout(
         test_mode_toggle.change(
             fn=callbacks.handle_test_mode_change,
             inputs=test_mode_toggle,
-            outputs=[cleaning_only_toggle, upscaling_only_toggle],
+            outputs=[cleaning_only_toggle, upscaling_only_toggle, mask_preview_only_toggle],
+            queue=False,
+        )
+
+        # Mask preview toggle change handler
+        mask_preview_only_toggle.change(
+            fn=callbacks.handle_mask_preview_only_change,
+            inputs=mask_preview_only_toggle,
+            outputs=[cleaning_only_toggle, upscaling_only_toggle, test_mode_toggle],
             queue=False,
         )
 
@@ -3881,6 +4002,122 @@ def create_layout(
             cancels=batch_event,
             queue=False,
         )
+
+        # Simulation State for Step 1 -> Step 2
+        sim_cache_state = gr.State(value={})
+
+        def _with_sim_language_overrides(components: list) -> list:
+            """Use the Simulasi tab's own language dropdowns instead of the Translator tab's."""
+            return [
+                sim_source_language
+                if component is input_language
+                else sim_target_language
+                if component is output_language
+                else component
+                for component in components
+            ]
+
+        # Simulation Tab Buttons
+        sim_clear_button.click(
+            fn=lambda: (None, None, None, None, [], [], gr.update(value="", lines=1), {}),
+            outputs=[
+                sim_input_image,
+                sim_annotated_image,
+                sim_cleaned_image,
+                sim_typeset_image,
+                sim_gallery,
+                sim_dataframe,
+                sim_status_message,
+                sim_cache_state,
+            ],
+            queue=False,
+        ).then(fn=None, js=js_reset_status_height, queue=False)
+
+        simulation_inputs = [
+            sim_input_image,
+            sim_run_ocr,
+        ] + _with_sim_language_overrides(translate_inputs[1:])
+
+        sim_run_event = sim_run_button.click(
+            fn=functools.partial(
+                callbacks.update_sim_buttons,
+                processing=True,
+            ),
+            outputs=[
+                sim_run_button,
+                sim_clear_button,
+            ],
+            queue=False,
+        ).then(
+            fn=functools.partial(
+                callbacks.handle_simulate_click,
+                models_dir=models_dir,
+                fonts_base_dir=fonts_base_dir,
+                target_device=target_device,
+            ),
+            inputs=simulation_inputs,
+            outputs=[
+                sim_annotated_image,
+                sim_gallery,
+                sim_dataframe,
+                sim_status_message,
+                sim_cache_state,
+            ],
+        )
+        sim_run_event.then(
+            fn=functools.partial(
+                callbacks.update_sim_buttons,
+                processing=False,
+            ),
+            outputs=[
+                sim_run_button,
+                sim_clear_button,
+            ],
+            queue=False,
+        ).then(fn=None, js=js_reset_status_height, queue=False)
+
+        simulation_translate_inputs = [
+            sim_input_image,
+            sim_cache_state,
+        ] + _with_sim_language_overrides(translate_inputs[1:])
+
+        sim_trans_event = sim_translate_button.click(
+            fn=functools.partial(
+                callbacks.update_sim_translate_buttons,
+                processing=True,
+            ),
+            outputs=[
+                sim_translate_button,
+                sim_clear_button,
+            ],
+            queue=False,
+        ).then(
+            fn=functools.partial(
+                callbacks.handle_simulate_translate_click,
+                models_dir=models_dir,
+                fonts_base_dir=fonts_base_dir,
+                target_device=target_device,
+            ),
+            inputs=simulation_translate_inputs,
+            outputs=[
+                sim_cleaned_image,
+                sim_typeset_image,
+                sim_dataframe,
+                sim_status_message,
+            ],
+        )
+        sim_trans_event.then(
+            fn=functools.partial(
+                callbacks.update_sim_translate_buttons,
+                processing=False,
+            ),
+            outputs=[
+                sim_translate_button,
+                sim_clear_button,
+            ],
+            queue=False,
+        ).then(fn=None, js=js_reset_status_height, queue=False)
+
 
         app.load(
             fn=callbacks.handle_app_load,

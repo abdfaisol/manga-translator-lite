@@ -3,6 +3,7 @@ import os
 from collections import OrderedDict
 from pathlib import Path
 
+import skia
 from fontTools.ttLib import TTFont
 
 from utils.exceptions import FontError
@@ -42,6 +43,47 @@ _font_data_cache = LRUCache(max_size=50)
 _font_features_cache = LRUCache(max_size=50)
 _font_cmap_cache = LRUCache(max_size=50)
 _font_variants_cache: dict[str, dict[str, Path | None]] = {}
+
+_font_mgr: skia.FontMgr | None = None
+_symbol_typeface_cache: dict[int, skia.Typeface | None] = {}
+_symbol_font_cache: dict[tuple[int, int], skia.Font] = {}
+
+def get_symbol_typeface(codepoint: int) -> skia.Typeface | None:
+    """Platform fallback typeface for a codepoint the primary font lacks.
+
+    Lets symbols such as ♥ ♡ ♪ survive rendering instead of being stripped
+    from the translation. Returns None when no installed font covers it.
+    """
+    if codepoint in _symbol_typeface_cache:
+        return _symbol_typeface_cache[codepoint]
+
+    global _font_mgr
+    typeface: skia.Typeface | None = None
+    try:
+        if _font_mgr is None:
+            _font_mgr = skia.FontMgr()
+        candidate = _font_mgr.matchFamilyStyleCharacter(
+            "", skia.FontStyle(), [], codepoint
+        )
+        if candidate is not None and skia.Font(candidate, 16).unicharToGlyph(codepoint):
+            typeface = candidate
+    except Exception as e:
+        log_message(
+            f"Symbol fallback lookup failed for U+{codepoint:04X}: {e}",
+            verbose=True,
+        )
+
+    _symbol_typeface_cache[codepoint] = typeface
+    return typeface
+
+def get_symbol_font(typeface: skia.Typeface, font_size: float) -> skia.Font:
+    """Cached Skia font for a fallback typeface at a given size."""
+    key = (id(typeface), int(font_size))
+    font = _symbol_font_cache.get(key)
+    if font is None:
+        font = skia.Font(typeface, font_size)
+        _symbol_font_cache[key] = font
+    return font
 
 # Font style detection keywords
 FONT_KEYWORDS = {
@@ -140,8 +182,9 @@ def sanitize_text_for_font(text: str, font_path: str, verbose: bool = False) -> 
     Removes characters from text that are not supported by the font's cmap.
 
     This prevents "tofu" characters (▯) from appearing in rendered text.
-    Style markers (*, **, ***) are preserved even if asterisk is not in the font,
-    since they are stripped during text processing and never actually rendered.
+    Characters covered by a platform fallback font are kept (drawn with that
+    font); style markers (*, **, ***) are always preserved since they are
+    stripped during text processing and never actually rendered.
 
     Args:
         text: The text to sanitize.
@@ -177,6 +220,7 @@ def sanitize_text_for_font(text: str, font_path: str, verbose: bool = False) -> 
             char in STYLE_MARKER_CHARS
             or char in WHITESPACE_CHARS
             or codepoint in supported_codepoints
+            or get_symbol_typeface(codepoint) is not None
         ):
             sanitized_chars.append(char)
         else:

@@ -87,7 +87,7 @@ class UITranslationLLMSettings:
     ero_doujinshi_mode: bool = False
     ocr_correction: bool = False
     force_cache_translations: bool = False
-    ocr_method: str = "LLM"  # "LLM", "manga-ocr", or "paddleocr-vl-1.6"
+    ocr_method: str = "LLM"  # "LLM", "Auto", "manga-ocr", "paddleocr-vl-1.6", or "rapidocr"
 
 
 @dataclass
@@ -193,6 +193,7 @@ class UIGeneralSettings:
     cleaning_only: bool = False
     upscaling_only: bool = False
     test_mode: bool = False
+    mask_preview_only: bool = False
     enable_web_search: bool = (
         False  # Enable model's built-in web search for up-to-date information.
     )
@@ -378,6 +379,7 @@ class UIConfigState:
             "cleaning_only": self.general.cleaning_only,
             "upscaling_only": self.general.upscaling_only,
             "test_mode": self.general.test_mode,
+            "mask_preview_only": self.general.mask_preview_only,
             "enable_web_search": self.general.enable_web_search,
             "enable_code_execution": self.general.enable_code_execution,
             "use_custom_sampling": self.general.use_custom_sampling,
@@ -726,6 +728,9 @@ class UIConfigState:
                     "upscaling_only", defaults.get("upscaling_only", False)
                 ),
                 test_mode=data.get("test_mode", defaults.get("test_mode", False)),
+                mask_preview_only=data.get(
+                    "mask_preview_only", defaults.get("mask_preview_only", False)
+                ),
                 enable_web_search=data.get(
                     "enable_web_search", defaults.get("enable_web_search", False)
                 ),
@@ -1007,6 +1012,7 @@ def map_ui_to_backend_config(
         cleaning_only=ui_state.general.cleaning_only,
         upscaling_only=ui_state.general.upscaling_only,
         test_mode=ui_state.general.test_mode,
+        mask_preview_only=ui_state.general.mask_preview_only,
         parallel_requests=ui_state.batch_parallel_requests if is_batch else 1,
         batch_parallel_within_pages=(
             bool(ui_state.batch_parallel_within_pages) if is_batch else False

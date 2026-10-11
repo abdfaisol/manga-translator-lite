@@ -52,6 +52,8 @@ from .outside_text_processor import (
 )
 from .services.translation import (
     call_translation_api_batch,
+    is_japanese_language,
+    resolve_ocr_engine,
     prepare_bubble_images_for_translation,
 )
 from .text.placeholders import generate_test_placeholders
@@ -72,6 +74,7 @@ def _should_overlap_llm_with_inpaint(config: MangaTranslatorConfig) -> bool:
         bool(getattr(config, "overlap_llm_with_inpaint", False))
         and not config.cleaning_only
         and not getattr(config, "test_mode", False)
+        and not getattr(config, "mask_preview_only", False)
     )
 
 
@@ -298,7 +301,7 @@ def _get_cached_previous_context_image(
     image_path: Path,
     config: MangaTranslatorConfig,
     context_cache: OrderedDict | None,
-    context_cache_lock: threading.Lock | None,
+    context_cache_lock: "threading.Lock | None",
 ) -> dict[str, str] | None:
     verbose = config.verbose
     if context_cache is None:
@@ -334,7 +337,7 @@ def _build_previous_context_images(
     image_index: int,
     config: MangaTranslatorConfig,
     context_cache: OrderedDict | None = None,
-    context_cache_lock: threading.Lock | None = None,
+    context_cache_lock: "threading.Lock | None" = None,
 ) -> list[dict[str, str]]:
     if not getattr(config.translation, "send_full_page_context", False):
         return []
@@ -367,7 +370,7 @@ def _build_previous_context_texts(
     image_index: int,
     config: MangaTranslatorConfig,
     ocr_text_history: dict[Path, list[str]] | None = None,
-    ocr_text_history_lock: threading.Lock | None = None,
+    ocr_text_history_lock: "threading.Lock | None" = None,
 ) -> list[list[str]]:
     """Collect OCR transcripts from up to N already-processed prior pages.
 
@@ -601,6 +604,401 @@ def _write_llm_crop_debug_images(
     )
 
 
+def _extract_preview_bbox(item):
+    """Extract (x1, y1, x2, y2) integer bbox from varied item formats."""
+    if item is None:
+        return None
+    if isinstance(item, (list, tuple)):
+        if len(item) == 2 and isinstance(item[0], (list, tuple)):
+            coords = item[0]
+        elif len(item) == 4 and all(isinstance(v, (int, float)) for v in item):
+            coords = item
+        else:
+            return None
+    elif isinstance(item, dict):
+        b = item.get("bbox") or item.get("box_2d")
+        if isinstance(b, dict):
+            return (
+                round(b.get("xmin", 0)),
+                round(b.get("ymin", 0)),
+                round(b.get("xmax", 0)),
+                round(b.get("ymax", 0)),
+            )
+        coords = b
+    else:
+        return None
+    if coords is not None and len(coords) == 4:
+        return tuple(round(float(v)) for v in coords)
+    return None
+
+
+def _write_mask_preview_image(
+    pil_image,
+    bubble_data,
+    mask_groups,
+    outside_text_results,
+    raw_outside_text_results,
+    image_path,
+    output_path,
+    verbose=False,
+):
+    """Overlay detection/mask bounding boxes on the page for placement checks.
+
+    Green = speech bubble masks, blue dashed = raw OSB detection boxes,
+    orange dashed = expanded OSB boxes, magenta = actual inpaint mask
+    regions (mask_groups) that get redrawn.
+    """
+    canvas = pil_image.convert("RGBA").copy()
+
+    bubble_color = (34, 160, 34)
+    osb_raw_color = (32, 63, 255)
+    osb_expanded_color = (255, 128, 0)
+    mask_color = (255, 0, 255)
+
+    width, height = canvas.size
+    font = _load_debug_font(max(14, min(width, height) // 28))
+
+    for bubble in bubble_data or []:
+        bbox = _extract_preview_bbox(bubble)
+        if bbox is None:
+            continue
+        _apply_mask_debug_overlay(canvas, bubble.get("sam_mask"), bubble_color + (84,))
+        _draw_dashed_rectangle(ImageDraw.Draw(canvas), bbox, bubble_color, width=2)
+
+    draw = ImageDraw.Draw(canvas)
+    for item in raw_outside_text_results or []:
+        bbox = _extract_preview_bbox(item)
+        if bbox is not None:
+            _draw_dashed_rectangle(draw, bbox, osb_raw_color, width=2)
+
+    for idx, item in enumerate(outside_text_results or [], start=1):
+        bbox = _extract_preview_bbox(item)
+        if bbox is not None:
+            _draw_dashed_rectangle(draw, bbox, osb_expanded_color, width=2)
+            _draw_centered_index(draw, bbox, idx, font, (255, 0, 0))
+
+    for group in mask_groups or []:
+        _apply_mask_debug_overlay(canvas, group.get("combined_mask"), mask_color + (84,))
+
+    draw = ImageDraw.Draw(canvas)
+    for idx, group in enumerate(mask_groups or [], start=1):
+        mask_bbox = _debug_mask_bbox(group.get("combined_mask"))
+        if mask_bbox is None:
+            mask_bbox = _extract_preview_bbox(group)
+        if mask_bbox is None:
+            continue
+        draw.rectangle(mask_bbox, outline=mask_color, width=3)
+        _draw_centered_index(draw, mask_bbox, idx, font, (255, 0, 0))
+
+    base_path = Path(output_path) if output_path else Path(image_path)
+    preview_path = base_path.parent / f"{base_path.stem}.mask-preview.png"
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.convert("RGB").save(preview_path, format="PNG")
+    log_message(
+        f"Wrote mask preview image: {preview_path}",
+        verbose=verbose,
+        always_print=True,
+    )
+    return canvas.convert("RGB")
+
+
+
+
+def simulate_mask_and_ocr(
+    image_path: str | Path,
+    config: MangaTranslatorConfig,
+    run_ocr: bool = True,
+    verbose: bool = False,
+    cancellation_manager: Optional[Any] = None,
+) -> tuple[Image.Image, list[tuple[Image.Image, str]], list[list[Any]], str]:
+    """Detect text regions (speech bubbles + OSB), draw red bounding boxes, and extract OCR per item."""
+    import io
+
+    start_time = time.time()
+    image_path = Path(image_path)
+    device = config.device
+    pil_image = Image.open(image_path)
+    if pil_image.mode != "RGB":
+        pil_image = pil_image.convert("RGB")
+
+    pil_image_processed = pil_image.copy()
+    pre_factor = _resolve_pre_upscale_factor(
+        getattr(config, "preprocessing", None), verbose=verbose
+    )
+    if pre_factor > 1.01:
+        pil_image_processed = upscale_image_to_dimension(
+            pil_image_processed,
+            (
+                round(pil_image_processed.width * pre_factor),
+                round(pil_image_processed.height * pre_factor),
+            ),
+            model_type=config.preprocessing.model,
+            verbose=verbose,
+        )
+
+    get_cache().set_current_image(pil_image_processed, verbose)
+    original_cv_image = pil_to_cv2(pil_image_processed)
+
+    log_message("Simulation: Detecting speech bubbles...", verbose=verbose, always_print=True)
+    bubble_data, text_free_boxes = detect_speech_bubbles(
+        image_path,
+        config.yolo_model_path,
+        config.detection.confidence,
+        verbose=verbose,
+        device=device,
+        seg_model=config.detection.seg_model,
+        conjoined_detection=config.detection.conjoined_detection,
+        conjoined_confidence=config.detection.conjoined_confidence,
+        image_override=pil_image_processed,
+        osb_enabled=config.outside_text.enabled,
+        osb_text_verification=config.detection.use_osb_text_verification,
+        osb_text_hf_token=config.outside_text.huggingface_token,
+        bubble_detector_model=config.detection.bubble_detector_model,
+    )
+
+    panels = None
+    if config.detection.use_panel_sorting:
+        try:
+            panels = detect_panels(
+                image_path,
+                confidence=config.detection.panel_confidence,
+                device=device,
+                verbose=verbose,
+            )
+        except Exception as e:
+            log_message(f"Panel detection failed: {e}", verbose=verbose)
+            panels = None
+
+    outside_text_data = []
+    outside_work = None
+    if config.outside_text.enabled:
+        log_message("Simulation: Detecting outside text...", verbose=verbose, always_print=True)
+        image_format = getattr(pil_image, "format", "PNG") or "PNG"
+        outside_work = prepare_outside_text_work(
+            pil_image_processed,
+            config,
+            image_path,
+            image_format,
+            verbose,
+            bubble_data=bubble_data,
+            text_free_boxes=text_free_boxes,
+            panels=panels,
+        )
+        if outside_work is not None:
+            outside_text_data = outside_work.outside_text_data or []
+
+    if bubble_data:
+        bubble_data = prepare_bubble_images_for_translation(
+            bubble_data,
+            original_cv_image,
+            upscale_model=None,
+            device=device,
+            mime_type="image/png",
+            bubble_min_side_pixels=config.translation.bubble_min_side_pixels,
+            upscale_method="none",
+            whiteout_conjoined_bubbles=config.translation.whiteout_conjoined_bubbles,
+            verbose=verbose,
+        )
+
+    valid_bubbles = [b for b in (bubble_data or []) if b.get("image_b64") or b.get("bbox")]
+    all_text_data = valid_bubbles + outside_text_data
+    reading_direction = config.translation.reading_direction
+    sorted_items = sort_bubbles_by_reading_order(
+        all_text_data, reading_direction, panels=panels
+    )
+
+    canvas = pil_image_processed.copy().convert("RGBA")
+    draw = ImageDraw.Draw(canvas)
+    width, height = canvas.size
+    box_width = max(2, min(width, height) // 300)
+    font = _load_debug_font(max(14, min(width, height) // 28))
+
+    for idx, item in enumerate(sorted_items, start=1):
+        bbox = _extract_preview_bbox(item)
+        if bbox is None:
+            continue
+        draw.rectangle(bbox, outline=(255, 0, 0, 255), width=box_width)
+        _draw_centered_index(draw, bbox, idx, font, (255, 0, 0))
+
+    annotated_image = canvas.convert("RGB")
+
+    crops = []
+    items_info = []
+    for idx, item in enumerate(sorted_items, start=1):
+        crop_pil = None
+        if item.get("image_b64"):
+            try:
+                raw_bytes = base64.b64decode(item["image_b64"])
+                crop_pil = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+            except Exception:
+                crop_pil = None
+        if crop_pil is None:
+            bbox = _extract_preview_bbox(item)
+            if bbox:
+                x1, y1, x2, y2 = [max(0, int(v)) for v in bbox]
+                x2 = min(pil_image_processed.width, x2)
+                y2 = min(pil_image_processed.height, y2)
+                if x2 > x1 and y2 > y1:
+                    crop_pil = pil_image_processed.crop((x1, y1, x2, y2))
+        if crop_pil is None:
+            crop_pil = Image.new("RGB", (64, 64), (220, 220, 220))
+
+        crops.append(crop_pil)
+        # Keep the detection-space crop for patch restore; gallery crop may be upscaled.
+        if not item.get("original_crop_pil"):
+            bbox = _extract_preview_bbox(item)
+            if bbox:
+                x1, y1, x2, y2 = [max(0, int(v)) for v in bbox]
+                x2 = min(pil_image_processed.width, x2)
+                y2 = min(pil_image_processed.height, y2)
+                if x2 > x1 and y2 > y1:
+                    item["original_crop_pil"] = pil_image_processed.crop(
+                        (x1, y1, x2, y2)
+                    )
+        item_type = "OSB" if item.get("is_outside_text", False) else "Bubble"
+        bbox = _extract_preview_bbox(item) or (0, 0, 0, 0)
+        items_info.append({
+            "index": idx,
+            "type": item_type,
+            "bbox": list(bbox),
+            "crop": crop_pil,
+            "confidence": float(item.get("confidence", 0.0)),
+        })
+
+    ocr_texts = []
+    ocr_engine = "Skipped"
+    if run_ocr and crops:
+        # "Auto" routes by source language: manga-ocr (Japanese), PP-OCRv5
+        # Korean (Korean), PP-OCRv4 (Chinese/English), LLM vision OCR
+        # (everything else, incl. unknown).
+        source_language = config.translation.input_language
+        ocr_engine = resolve_ocr_engine(
+            config.translation.ocr_method, source_language
+        )
+
+        log_message(
+            f"Running {ocr_engine} on {len(crops)} crops "
+            f"(source language: {source_language or 'unknown'})...",
+            always_print=True,
+        )
+        try:
+            if ocr_engine == "manga-ocr":
+                from core.image.ocr_detection import extract_text_with_manga_ocr
+
+                ocr_texts = extract_text_with_manga_ocr(crops, verbose=verbose)
+            elif ocr_engine == "rapidocr":
+                from core.image.ocr_detection import extract_text_with_rapidocr
+
+                ocr_texts = extract_text_with_rapidocr(crops, verbose=verbose)
+            elif ocr_engine == "rapidocr-korean":
+                from core.image.ocr_detection import extract_text_with_rapidocr
+
+                ocr_texts = extract_text_with_rapidocr(
+                    crops, verbose=verbose, language="korean"
+                )
+            elif ocr_engine == "paddleocr-vl-1.6":
+                from core.image.ocr_detection import extract_text_with_paddle_ocr_vl
+
+                ocr_texts = extract_text_with_paddle_ocr_vl(crops, verbose=verbose)
+            else:
+                from core.services.translation import perform_llm_ocr_on_images
+
+                ocr_texts = perform_llm_ocr_on_images(
+                    config.translation, crops, debug=verbose
+                )
+        except Exception as e:
+            log_message(f"Simulation OCR error: {e}", always_print=True)
+            ocr_texts = [f"[OCR Error: {e}]"] * len(crops)
+
+        # LLM refusals/timeouts leave holes; the rest of the page reveals the
+        # script, so retry only those crops with the matching offline engine.
+        from core.services.translation import retry_failed_ocr_locally
+
+        ocr_texts = retry_failed_ocr_locally(
+            crops,
+            ocr_texts,
+            source_language=source_language,
+            primary_engine=ocr_engine,
+            verbose=verbose,
+        )
+    else:
+        ocr_texts = ["(OCR skipped)"] * len(crops)
+
+    for item, text in zip(sorted_items, ocr_texts):
+        item["ocr_text"] = text
+
+    gallery_items = []
+    table_rows = []
+    for info, ocr_text in zip(items_info, ocr_texts):
+        idx = info["index"]
+        itype = info["type"]
+        bbox_str = f"[{info['bbox'][0]}, {info['bbox'][1]}, {info['bbox'][2]}, {info['bbox'][3]}]"
+        caption = f"#{idx} [{itype}] {ocr_text}"
+        gallery_items.append((info["crop"], caption))
+        table_rows.append([idx, itype, bbox_str, ocr_text, ""])
+
+    duration = time.time() - start_time
+    bubble_cnt = sum(1 for i in items_info if i["type"] == "Bubble")
+    osb_cnt = sum(1 for i in items_info if i["type"] == "OSB")
+    ocr_status = ocr_engine if run_ocr else "Skipped"
+    status_msg = (
+        f"Simulation completed in {duration:.2f}s.\n"
+        f"• Total items: {len(sorted_items)} ({bubble_cnt} speech bubbles, {osb_cnt} outside text)\n"
+        f"• OCR: {ocr_status}"
+    )
+
+    simulation_cache = {
+        "sorted_items": sorted_items,
+        "ocr_texts": ocr_texts,
+        "outside_work": outside_work,
+    }
+
+    return annotated_image, gallery_items, table_rows, status_msg, simulation_cache
+
+
+def simulate_full_pipeline(
+    image_path: str | Path,
+    config: MangaTranslatorConfig,
+    verbose: bool = False,
+    cancellation_manager: Optional[Any] = None,
+    pre_detected_items: Optional[list[dict[str, Any]]] = None,
+    pre_extracted_ocr_texts: Optional[list[str]] = None,
+    pre_outside_work: Optional[Any] = None,
+) -> tuple[Image.Image, Image.Image, list[list[Any]], str]:
+    """Run full translation pipeline in simulation mode and return (cleaned_image, final_typeset_image, table_rows, status)."""
+    start_time = time.time()
+    res = translate_and_render(
+        image_path=image_path,
+        config=config,
+        output_path=None,
+        cancellation_manager=cancellation_manager,
+        return_details=True,
+        pre_extracted_ocr_texts=pre_extracted_ocr_texts,
+        pre_detected_items=pre_detected_items,
+        pre_outside_work=pre_outside_work,
+    )
+    final_img = res.get("final_image")
+    cleaned_img = res.get("cleaned_image") or final_img
+    translations = res.get("translated_texts", [])
+    items = res.get("items_info", [])
+
+    table_rows = []
+    for idx, (item, trans) in enumerate(zip(items, translations), start=1):
+        itype = "OSB" if item.get("is_outside_text", False) else "Bubble"
+        bbox = _extract_preview_bbox(item) or (0, 0, 0, 0)
+        bbox_str = f"[{bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]}]"
+        ocr_text = item.get("ocr_text", "")
+        table_rows.append([idx, itype, bbox_str, ocr_text, trans])
+
+    duration = time.time() - start_time
+    status = (
+        f"Simulasi Translate selesai dalam {duration:.2f}s.\n"
+        f"• Total teks: {len(table_rows)}\n"
+        f"• Status: Berhasil dibersihkan (cleaning) & ditypeset (typesetting)."
+    )
+    return cleaned_img, final_img, table_rows, status
+
+
 def _resolve_pre_upscale_factor(
     pre_cfg: PreprocessingConfig | None,
     verbose: bool = False,
@@ -646,6 +1044,10 @@ def translate_and_render(
     previous_context_texts: list[list[str]] | None = None,
     previous_context_texts_provider: Callable[[], list[list[str]]] | None = None,
     ocr_texts_out: list[str] | None = None,
+    pre_extracted_ocr_texts: list[str] | None = None,
+    pre_detected_items: list[dict[str, Any]] | None = None,
+    pre_outside_work: Optional[Any] = None,
+    return_details: bool = False,
 ):
     """
     Main function to translate manga speech bubbles and render translations using a config object.
@@ -776,69 +1178,149 @@ def translate_and_render(
     get_cache().set_current_image(pil_image_processed, verbose)
 
     original_cv_image = pil_to_cv2(pil_image_processed)
+    original_uncleaned_image = pil_image_processed.copy()
     full_page_context_source = pil_image_processed.copy()
 
     # Detect speech bubbles first so OSB processing can respect bubble regions
-    log_message("Detecting speech bubbles...", verbose=verbose)
-    try:
-        bubble_data, text_free_boxes = detect_speech_bubbles(
-            image_path,
-            config.yolo_model_path,
-            config.detection.confidence,
-            verbose=verbose,
-            device=device,
-            seg_model=config.detection.seg_model,
-            conjoined_detection=config.detection.conjoined_detection,
-            conjoined_confidence=config.detection.conjoined_confidence,
-            image_override=pil_image_processed,
-            osb_enabled=config.outside_text.enabled,
-            osb_text_verification=config.detection.use_osb_text_verification,
-            osb_text_hf_token=config.outside_text.huggingface_token,
-            bubble_detector_model=config.detection.bubble_detector_model,
-        )
-    except Exception as e:
-        log_message(f"Error during detection: {e}", always_print=True)
-        bubble_data = []
+    if pre_detected_items is not None:
+        log_message("Using pre-detected items, skipping bubble and OSB detection...", verbose=verbose, always_print=True)
+        bubble_data = [b for b in pre_detected_items if not b.get("is_outside_text", False)]
+        outside_text_data = [b for b in pre_detected_items if b.get("is_outside_text", False)]
         text_free_boxes = []
-
-    panels = None
-    debug_panels = None
-    if config.detection.use_panel_sorting or ENABLE_COMPONENT_ORDER_DEBUG:
+        panels = None
+    else:
+        log_message("Detecting speech bubbles...", verbose=verbose)
         try:
-            log_message(
-                "Detecting panels...",
-                verbose=verbose,
-            )
-            debug_panels = detect_panels(
+            bubble_data, text_free_boxes = detect_speech_bubbles(
                 image_path,
-                confidence=config.detection.panel_confidence,
-                device=device,
+                config.yolo_model_path,
+                config.detection.confidence,
                 verbose=verbose,
+                device=device,
+                seg_model=config.detection.seg_model,
+                conjoined_detection=config.detection.conjoined_detection,
+                conjoined_confidence=config.detection.conjoined_confidence,
+                image_override=pil_image_processed,
+                osb_enabled=config.outside_text.enabled,
+                osb_text_verification=config.detection.use_osb_text_verification,
+                osb_text_hf_token=config.outside_text.huggingface_token,
+                bubble_detector_model=config.detection.bubble_detector_model,
             )
-            if debug_panels:
+        except Exception as e:
+            log_message(f"Error during detection: {e}", always_print=True)
+            bubble_data = []
+            text_free_boxes = []
+
+        panels = None
+        debug_panels = None
+        if config.detection.use_panel_sorting or ENABLE_COMPONENT_ORDER_DEBUG:
+            try:
                 log_message(
-                    f"Detected {len(debug_panels)} panels",
-                    always_print=True,
-                )
-            else:
-                log_message(
-                    "No panels detected",
+                    "Detecting panels...",
                     verbose=verbose,
                 )
-        except Exception as e:
-            log_message(
-                f"Panel detection failed: {e}. Using global sorting.",
-                always_print=True,
-            )
-            debug_panels = None
+                debug_panels = detect_panels(
+                    image_path,
+                    confidence=config.detection.panel_confidence,
+                    device=device,
+                    verbose=verbose,
+                )
+                if debug_panels:
+                    log_message(
+                        f"Detected {len(debug_panels)} panels",
+                        always_print=True,
+                    )
+                else:
+                    log_message(
+                        "No panels detected",
+                        verbose=verbose,
+                    )
+            except Exception as e:
+                log_message(
+                    f"Panel detection failed: {e}. Using global sorting.",
+                    always_print=True,
+                )
+                debug_panels = None
 
         if config.detection.use_panel_sorting:
             panels = debug_panels
 
+    # Mask preview mode: detect bubble + OSB masks, draw bounding boxes, stop early.
+    if getattr(config, "mask_preview_only", False):
+        log_message(
+            "Mask preview mode - drawing bounding boxes, skipping redraw and translation",
+            always_print=True,
+        )
+        preview_work = prepare_outside_text_work(
+            pil_image_processed,
+            config,
+            image_path,
+            image_format,
+            verbose,
+            bubble_data=bubble_data,
+            text_free_boxes=text_free_boxes,
+            panels=panels,
+        )
+        final_image_to_save = _write_mask_preview_image(
+            pil_image_processed,
+            bubble_data,
+            preview_work.mask_groups if preview_work is not None else [],
+            preview_work.outside_text_results if preview_work is not None else [],
+            preview_work.raw_outside_text_results if preview_work is not None else [],
+            image_path,
+            output_path,
+            verbose=verbose,
+        )
+
+        if output_path:
+            if final_image_to_save.mode != target_mode:
+                final_image_to_save = final_image_to_save.convert(target_mode)
+            try:
+                save_image_with_compression(
+                    final_image_to_save,
+                    output_path,
+                    jpeg_quality=config.output.jpeg_quality,
+                    png_compression=config.output.png_compression,
+                    verbose=verbose,
+                )
+            except ImageProcessingError as e:
+                log_message(f"Failed to save image: {e}", always_print=True)
+                raise
+
+        processing_time = time.time() - start_time
+        log_message(
+            f"Processing completed in {processing_time:.2f}s", always_print=True
+        )
+        return final_image_to_save
+
     # Process outside text (detect always; optionally defer inpainting for LLM overlap)
     use_llm_inpaint_overlap = _should_overlap_llm_with_inpaint(config)
     outside_work = None
-    if use_llm_inpaint_overlap:
+    if pre_detected_items is not None:
+        # Pre-detected items already contain outside_text_data
+        original_cv_image = pil_to_cv2(pil_image_processed)
+        if outside_text_data:
+            outside_work = pre_outside_work
+            if outside_work is None and config.outside_text.enabled:
+                image_format = getattr(pil_image_processed, "format", "PNG") or "PNG"
+                outside_work = prepare_outside_text_work(
+                    pil_image_processed,
+                    config,
+                    image_path,
+                    image_format,
+                    verbose,
+                    bubble_data=bubble_data,
+                    text_free_boxes=text_free_boxes,
+                    panels=panels,
+                )
+            if outside_work is not None:
+                outside_work.config = config
+                outside_work.verbose = verbose
+                outside_work.pil_image = pil_image_processed
+                if not use_llm_inpaint_overlap:
+                    log_message("Cleaning outside text regions...", verbose=verbose, always_print=True)
+                    pil_image_processed, _ = finish_outside_text_work(outside_work)
+    elif use_llm_inpaint_overlap:
         outside_work = prepare_outside_text_work(
             pil_image_processed,
             config,
@@ -1208,9 +1690,13 @@ def translate_and_render(
                         panels = None
 
                 # Sort all text elements (speech bubbles + OSB text) by reading order
-                sorted_bubble_data = sort_bubbles_by_reading_order(
-                    all_text_data, reading_direction, panels=panels
-                )
+                if pre_detected_items is not None:
+                    # Maintain the exact order from pre_detected_items
+                    sorted_bubble_data = pre_detected_items
+                else:
+                    sorted_bubble_data = sort_bubbles_by_reading_order(
+                        all_text_data, reading_direction, panels=panels
+                    )
                 if ENABLE_COMPONENT_ORDER_DEBUG:
                     bubble_debug_masks = {}
                     for bubble in sorted_bubble_data:
@@ -1347,6 +1833,7 @@ def translate_and_render(
                         previous_context_images=previous_context_images,
                         previous_context_texts=resolved_previous_texts,
                         ocr_texts_output=ocr_texts,
+                        pre_extracted_ocr_texts=pre_extracted_ocr_texts,
                         debug=verbose,
                     )
                     return texts, ocr_texts
@@ -1542,13 +2029,55 @@ def translate_and_render(
                     if "bbox" in info and "color" in info and "mask" in info
                 }
                 log_message("Rendering translations...", verbose=verbose)
+                clean_only_image = pil_cleaned_image.copy()
                 if len(translated_texts) == len(sorted_bubble_data):
                     invalid_translation_values = {
                         "[OCR FAILED]",
                         "[Empty response / no content]",
                     }
+                    # First pass: restore uncleaned patches where translation equals OCR (or OCR failed)
                     for i, bubble in enumerate(sorted_bubble_data):
                         bubble["translation"] = translated_texts[i]
+                        bbox = bubble["bbox"]
+                        text = bubble.get("translation", "")
+                        ocr_text = (bubble.get("ocr_text") or "").strip()
+                        trimmed_text = (text or "").strip()
+                        is_outside_text = bubble.get("is_outside_text", False)
+
+                        is_ocr_failed = (
+                            trimmed_text.upper() == "[OCR FAILED]"
+                            or ocr_text.upper() == "[OCR FAILED]"
+                            or ": OCR FAILED]" in trimmed_text.upper()
+                        )
+                        is_identical = (
+                            ocr_text
+                            and ocr_text not in invalid_translation_values
+                            and (ocr_text.lower() == trimmed_text.lower() or ocr_text == text.strip())
+                        )
+
+                        if is_ocr_failed or is_identical:
+                            # Crop from the pristine page: cached crops may be upscaled
+                            # or re-encoded, which would paste a mismatched patch.
+                            source_img = (
+                                original_uncleaned_image
+                                if "original_uncleaned_image" in locals()
+                                else pil_image_processed
+                            )
+                            original_patch = source_img.crop(
+                                (
+                                    round(bbox[0]),
+                                    round(bbox[1]),
+                                    round(bbox[2]),
+                                    round(bbox[3]),
+                                )
+                            )
+                            clean_only_image.paste(
+                                original_patch, (round(bbox[0]), round(bbox[1]))
+                            )
+
+                    pil_final_typeset_image = clean_only_image.copy()
+
+                    for i, bubble in enumerate(sorted_bubble_data):
                         bbox = bubble["bbox"]
                         text = bubble.get("translation", "")
                         ocr_text = (bubble.get("ocr_text") or "").strip()
@@ -1562,25 +2091,6 @@ def translate_and_render(
                             or ": OCR FAILED]" in trimmed_text.upper()
                         )
                         if is_ocr_failed:
-                            if "original_crop_pil" in bubble:
-                                log_message(
-                                    f"Restoring original {entry_type} patch due to OCR failure for {bbox}",
-                                    verbose=verbose,
-                                    always_print=True,
-                                )
-                                rendered_image = pil_cleaned_image.copy()
-                                original_patch = bubble["original_crop_pil"]
-                                rendered_image.paste(
-                                    original_patch,
-                                    (round(bbox[0]), round(bbox[1])),
-                                )
-                                pil_cleaned_image = rendered_image
-                                final_image_to_save = pil_cleaned_image
-                            else:
-                                log_message(
-                                    f"Skipping {entry_type} {bbox} - OCR failed and no original crop available",
-                                    verbose=verbose,
-                                )
                             continue
 
                         if (
@@ -1601,25 +2111,32 @@ def translate_and_render(
                             )
                             continue
 
-                        if is_outside_text:
-                            ocr_text = (bubble.get("ocr_text") or "").strip()
+                        if not is_outside_text:
+                            # Speech bubble: if translation equals original OCR text, skip typesetting
                             if (
                                 ocr_text
                                 and ocr_text not in invalid_translation_values
-                                and ocr_text == text.strip()
-                                and "original_crop_pil" in bubble
+                                and ocr_text.lower() == trimmed_text.lower()
                             ):
                                 log_message(
-                                    "Restoring original OSB patch because OCR matches translation "
+                                    f"Skipping typesetting because translation matches original for {bbox}",
+                                    verbose=verbose,
+                                    always_print=True,
+                                )
+                                continue
+
+                        if is_outside_text:
+                            if (
+                                ocr_text
+                                and ocr_text not in invalid_translation_values
+                                and (ocr_text.strip() == text.strip() or ocr_text.strip().lower() == trimmed_text.lower())
+                            ):
+                                log_message(
+                                    "Skipping OSB typesetting because OCR matches translation "
                                     f"for {bbox}",
                                     verbose=verbose,
                                     always_print=True,
                                 )
-                                rendered_image = pil_cleaned_image.copy()
-                                original_patch = bubble["original_crop_pil"]
-                                rendered_image.paste(original_patch, (bbox[0], bbox[1]))
-                                pil_cleaned_image = rendered_image
-                                final_image_to_save = pil_cleaned_image
                                 continue
 
                             text = text.upper()
@@ -1786,7 +2303,7 @@ def translate_and_render(
 
                             try:
                                 rendered_image = render_text_skia(
-                                    pil_image=pil_cleaned_image,
+                                    pil_image=pil_final_typeset_image,
                                     text=text,
                                     bbox=bbox,
                                     font_dir=font_dir,
@@ -1819,7 +2336,7 @@ def translate_and_render(
                                     )
                                     try:
                                         rendered_image = render_text_skia(
-                                            pil_image=pil_cleaned_image,
+                                            pil_image=pil_final_typeset_image,
                                             text=text,
                                             bbox=bbox,
                                             font_dir=font_dir,
@@ -1852,7 +2369,7 @@ def translate_and_render(
                                     )
                                     try:
                                         rendered_image = render_text_skia(
-                                            pil_image=pil_cleaned_image,
+                                            pil_image=pil_final_typeset_image,
                                             text=text,
                                             bbox=bbox,
                                             font_dir=font_dir,
@@ -1886,7 +2403,7 @@ def translate_and_render(
                                             verbose=verbose,
                                         )
                                         rendered_image = render_text_skia(
-                                            pil_image=pil_cleaned_image,
+                                            pil_image=pil_final_typeset_image,
                                             text=text,
                                             bbox=bbox,
                                             font_dir=font_dir,
@@ -1915,27 +2432,35 @@ def translate_and_render(
                                         )
                                         success = False
 
-                                # Tier 3: Restore original OSB patch if available
+                                # Tier 3: Restore the pristine OSB patch (bbox-aligned)
                                 if not success:
-                                    if "original_crop_pil" in bubble:
-                                        log_message(
-                                            f"Restoring original OSB patch for {bbox}",
-                                            verbose=verbose,
-                                            always_print=True,
-                                        )
-                                        rendered_image = pil_cleaned_image.copy()
-                                        original_patch = bubble["original_crop_pil"]
-                                        rendered_image.paste(
-                                            original_patch, (bbox[0], bbox[1])
-                                        )
-                                        success = True
-                                    else:
-                                        rendered_image = pil_cleaned_image
-                                        success = False
+                                    log_message(
+                                        f"Restoring original OSB patch for {bbox}",
+                                        verbose=verbose,
+                                        always_print=True,
+                                    )
+                                    rendered_image = pil_final_typeset_image.copy()
+                                    source_img = (
+                                        original_uncleaned_image
+                                        if "original_uncleaned_image" in locals()
+                                        else pil_final_typeset_image
+                                    )
+                                    rendered_image.paste(
+                                        source_img.crop(
+                                            (
+                                                round(bbox[0]),
+                                                round(bbox[1]),
+                                                round(bbox[2]),
+                                                round(bbox[3]),
+                                            )
+                                        ),
+                                        (round(bbox[0]), round(bbox[1])),
+                                    )
+                                    success = True
                         else:
                             try:
                                 rendered_image = render_text_skia(
-                                    pil_image=pil_cleaned_image,
+                                    pil_image=pil_final_typeset_image,
                                     text=text,
                                     bbox=bbox,
                                     font_dir=font_dir,
@@ -2022,7 +2547,7 @@ def translate_and_render(
 
                                     try:
                                         rendered_image = render_text_skia(
-                                            pil_image=pil_cleaned_image,
+                                            pil_image=pil_final_typeset_image,
                                             text=text,
                                             bbox=bbox,
                                             font_dir=font_dir,
@@ -2045,7 +2570,7 @@ def translate_and_render(
                                             f"Text rendering failed after Otsu retry: {e2}",
                                             verbose=verbose,
                                         )
-                                        rendered_image = pil_cleaned_image
+                                        rendered_image = pil_final_typeset_image
                                         success = False
                                 if not success:
                                     # Final fallback to padded bbox path
@@ -2060,7 +2585,7 @@ def translate_and_render(
                                     )
                                     try:
                                         rendered_image = render_text_skia(
-                                            pil_image=pil_cleaned_image,
+                                            pil_image=pil_final_typeset_image,
                                             text=text,
                                             bbox=bbox,
                                             font_dir=font_dir,
@@ -2079,18 +2604,18 @@ def translate_and_render(
                                             f"Text rendering failed: {e2}",
                                             verbose=verbose,
                                         )
-                                        rendered_image = pil_cleaned_image
+                                        rendered_image = pil_final_typeset_image
                                         success = False
                             except (RenderingError, FontError) as e:
                                 log_message(
                                     f"Text rendering failed: {e}", verbose=verbose
                                 )
-                                rendered_image = pil_cleaned_image
+                                rendered_image = pil_final_typeset_image
                                 success = False
 
                         if success:
-                            pil_cleaned_image = rendered_image
-                            final_image_to_save = pil_cleaned_image
+                            pil_final_typeset_image = rendered_image
+                            final_image_to_save = pil_final_typeset_image
                         else:
                             log_message(
                                 f"Failed to render bubble {bbox}", verbose=verbose
@@ -2133,6 +2658,14 @@ def translate_and_render(
     end_time = time.time()
     processing_time = end_time - start_time
     log_message(f"Processing completed in {processing_time:.2f}s", always_print=True)
+
+    if return_details:
+        return {
+            "final_image": final_image_to_save,
+            "cleaned_image": clean_only_image if "clean_only_image" in locals() else (pil_cleaned_image if "pil_cleaned_image" in locals() else final_image_to_save),
+            "translated_texts": translated_texts if "translated_texts" in locals() else [],
+            "items_info": sorted_bubble_data if "sorted_bubble_data" in locals() else [],
+        }
 
     return final_image_to_save
 

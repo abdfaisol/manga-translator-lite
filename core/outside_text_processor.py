@@ -21,7 +21,7 @@ from core.batch_coordinator import (
 )
 from core.config import MangaTranslatorConfig
 from core.image.image_utils import cv2_to_pil, pil_to_cv2, process_bubble_image_cached
-from core.image.inpainting import FluxKleinInpainter, FluxKontextInpainter
+from core.image.inpainting import FluxKleinInpainter, FluxKontextInpainter, lama_inpaint
 from core.image.ocr_detection import OutsideTextDetector, extract_text_with_manga_ocr
 from core.image.tilt_detection import (
     compute_effective_tilt_angle,
@@ -671,6 +671,28 @@ def prepare_outside_text_work(
         return None
 
 
+def _cv2_inpaint_fallback(image: Image.Image, mask: np.ndarray) -> Image.Image:
+    """Content-aware redraw of a masked region (Cleaning step).
+
+    Tries LaMa first (best quality, matches manga-image-translator), then falls
+    back to OpenCV Telea if LaMa is unavailable or errors.
+    """
+    m = np.asarray(mask, dtype=bool).astype(np.uint8) * 255
+    if not m.any():
+        return image
+
+    lama_result = lama_inpaint(image, np.asarray(mask, dtype=bool))
+    if lama_result is not None:
+        return lama_result
+
+    alpha = image.getchannel("A") if image.mode in ("RGBA", "LA") else None
+    # cv2.inpaint only accepts 8-bit 1/3-channel input; drop any alpha channel.
+    rgb = image.convert("RGB")
+    inpainted = cv2_to_pil(cv2.inpaint(pil_to_cv2(rgb), m, 3, cv2.INPAINT_TELEA))
+    if alpha is not None:
+        inpainted.putalpha(alpha)
+    return inpainted
+
 def _build_osb_simple_fill_mask(
     img_w: int,
     img_h: int,
@@ -794,7 +816,17 @@ def finish_outside_text_work(
         # Create inpainter based on selected method
         inpainting_method = config.outside_text.inpainting_method
         inpainter = None
-        if inpainting_method == "flux_klein_9b":
+        # ponytail: Flux on CPU takes tens of minutes per region, so skip it and let
+        # the LaMa/OpenCV redraw fallback handle non-solid regions instead.
+        flux_disabled = (
+            inpainting_method.startswith("flux") and config.device.type == "cpu"
+        )
+        if flux_disabled:
+            log_message(
+                f"{inpainting_method} requires a GPU; using LaMa/OpenCV redraw on CPU.",
+                always_print=True,
+            )
+        if inpainting_method == "flux_klein_9b" and not flux_disabled:
             try:
                 backend = config.outside_text.flux_backend
                 inpainter = FluxKleinInpainter(
@@ -822,7 +854,7 @@ def finish_outside_text_work(
                     verbose=verbose,
                 )
 
-        if inpainting_method == "flux_klein_4b":
+        if inpainting_method == "flux_klein_4b" and not flux_disabled:
             try:
                 backend = config.outside_text.flux_backend
                 inpainter = FluxKleinInpainter(
@@ -850,7 +882,7 @@ def finish_outside_text_work(
                     verbose=verbose,
                 )
 
-        if inpainting_method == "flux_kontext":
+        if inpainting_method == "flux_kontext" and not flux_disabled:
             try:
                 backend = config.outside_text.flux_backend
                 low_vram = (
@@ -890,7 +922,8 @@ def finish_outside_text_work(
             )
         elif inpainting_method == "opencv" or inpainter is None:
             inpainter = None
-            log_message("Using OpenCV simple fill for inpainting", verbose=verbose)
+            fallback_kind = "inpaint" if flux_disabled else "simple fill"
+            log_message(f"Using OpenCV {fallback_kind} for inpainting", verbose=verbose)
         current_image = pil_image
         temp_files = []
         none_skipped_clip_bboxes = set()
@@ -911,7 +944,7 @@ def finish_outside_text_work(
                 request_coordinator = getattr(config, "request_coordinator", None)
                 pending_flux_candidates = []
 
-                def apply_candidate_simple_fill(candidate, color_to_use):
+                def apply_candidate_simple_fill(candidate):
                     new_img = current_image.copy()
                     candidate_group = candidate["group"]
                     candidate_mask = candidate["mask"]
@@ -935,27 +968,9 @@ def finish_outside_text_work(
                     )
 
                     if rect_mask is None:
-                        mask_pil = Image.fromarray(
-                            (candidate_mask * 255).astype(np.uint8), mode="L"
-                        )
-                        patch = Image.new("RGB", new_img.size, color_to_use)
-                        new_img.paste(patch, (0, 0), mask=mask_pil)
-                        return new_img
+                        return _cv2_inpaint_fallback(new_img, candidate_mask)
 
-                    ys, xs = np.where(rect_mask)
-                    if len(xs) > 0 and len(ys) > 0:
-                        min_x, max_x = int(np.min(xs)), int(np.max(xs)) + 1
-                        min_y, max_y = int(np.min(ys)), int(np.max(ys)) + 1
-                        region_mask = rect_mask[min_y:max_y, min_x:max_x]
-                        mask_pil = Image.fromarray(
-                            (region_mask * 255).astype(np.uint8), mode="L"
-                        )
-                        patch = Image.new(
-                            "RGB", (max_x - min_x, max_y - min_y), color_to_use
-                        )
-                        new_img.paste(patch, (min_x, min_y), mask=mask_pil)
-
-                    return new_img
+                    return _cv2_inpaint_fallback(new_img, rect_mask)
 
                 def flush_pending_flux_candidates():
                     nonlocal current_image, flux_inpaints, cv2_inpaints
@@ -1014,16 +1029,13 @@ def finish_outside_text_work(
                         for result in results:
                             candidate = result["candidate"]
                             if result["error"] is not None:
-                                fallback_color_to_use = candidate["fallback_color"]
                                 log_message(
                                     f"Flux failed for OSB region {candidate['index']}"
                                     f" (Flux inpainting error: {result['error']}); "
-                                    f"falling back to CV2 fill ({fallback_color_to_use})",
+                                    "using redraw (LaMa/OpenCV)",
                                     always_print=True,
                                 )
-                                current_image = apply_candidate_simple_fill(
-                                    candidate, fallback_color_to_use
-                                )
+                                current_image = apply_candidate_simple_fill(candidate)
                                 cv2_inpaints += 1
                                 continue
 
@@ -1624,6 +1636,7 @@ def finish_outside_text_work(
                         b_ox1=ox1,
                         b_oy1=oy1,
                         comb_mask=combined_mask,
+                        use_inpaint=False,
                     ):
                         new_img = new_img_src.copy()
                         mask_indices = grp.get("mask_indices", [])
@@ -1641,8 +1654,14 @@ def finish_outside_text_work(
                             total_bubble_mask=total_bubble_mask,
                         )
 
+                        if use_inpaint:
+                            return _cv2_inpaint_fallback(
+                                new_img,
+                                rect_mask if rect_mask is not None else comb_mask,
+                            )
+
                         if rect_mask is None:
-                            # Full mask fill fallback
+                            # Full mask flat fill fallback
                             mask_pil = Image.fromarray(
                                 (comb_mask * 255).astype(np.uint8), mode="L"
                             )
@@ -1709,11 +1728,6 @@ def finish_outside_text_work(
                             {
                                 "index": i + 1,
                                 "mask": grouped_mask,
-                                "fallback_color": (
-                                    fallback_fill_color
-                                    if fallback_fill_color
-                                    else (255, 255, 255)
-                                ),
                             }
                         )
                         log_message(
@@ -1723,18 +1737,12 @@ def finish_outside_text_work(
                         continue
 
                     if request_coordinator is not None and inpainter is not None:
-                        fallback_color_to_use = (
-                            fallback_fill_color
-                            if fallback_fill_color
-                            else (255, 255, 255)
-                        )
                         pending_flux_candidates.append(
                             {
                                 "index": i + 1,
                                 "mask": combined_mask.copy(),
                                 "seed": region_seed,
                                 "composite_clip_bbox": composite_clip_bbox,
-                                "fallback_color": fallback_color_to_use,
                                 "group": group,
                                 "original_bbox_dict": original_bbox_dict,
                                 "original_bounds": (ox0, oy0, ox1, oy1),
@@ -1776,18 +1784,13 @@ def finish_outside_text_work(
                             flux_fail_reason = f"Flux inpainting error: {e}"
 
                     if flux_failed:
-                        fallback_color_to_use = (
-                            fallback_fill_color
-                            if fallback_fill_color
-                            else (255, 255, 255)
-                        )
                         log_message(
                             f"Flux failed for OSB region {i + 1}"
                             + (f" ({flux_fail_reason})" if flux_fail_reason else "")
-                            + f"; falling back to CV2 fill ({fallback_color_to_use})",
+                            + "; using redraw (LaMa/OpenCV)",
                             always_print=True,
                         )
-                        current_image = apply_simple_fill(fallback_color_to_use)
+                        current_image = apply_simple_fill(None, use_inpaint=True)
                         cv2_inpaints += 1
                         continue
 
@@ -1870,28 +1873,19 @@ def finish_outside_text_work(
                         except Exception as e:
                             log_message(
                                 "Grouped Flux inpainting failed "
-                                f"({e}); falling back to CV2 fill",
+                                f"({e}); using redraw (LaMa/OpenCV)",
                                 always_print=True,
                             )
                             for candidate in grouped_flux_candidates:
-                                mask_pil = Image.fromarray(
-                                    (candidate["mask"] * 255).astype(np.uint8),
-                                    mode="L",
+                                current_image = _cv2_inpaint_fallback(
+                                    current_image, candidate["mask"]
                                 )
-                                patch = Image.new(
-                                    "RGB",
-                                    current_image.size,
-                                    candidate["fallback_color"],
-                                )
-                                next_image = current_image.copy()
-                                next_image.paste(patch, (0, 0), mask=mask_pil)
-                                current_image = next_image
                             cv2_inpaints += len(grouped_flux_candidates)
 
                 log_message("Outside text inpainting completed", verbose=verbose)
                 parts = [
                     f"Flux: {flux_inpaints}",
-                    f"CV2: {cv2_inpaints}",
+                    f"LaMa/OpenCV: {cv2_inpaints}",
                 ]
                 if none_skips:
                     parts.append(f"Skipped (none): {none_skips}")
