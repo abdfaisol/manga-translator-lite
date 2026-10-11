@@ -515,6 +515,85 @@ def create_layout(
                             preview=True,
                         )
 
+            with gr.TabItem("Translate V2"):  # noqa: SIM117
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        v2_input_image = gr.Image(
+                            type="filepath",
+                            label="Upload Image",
+                            show_download_button=False,
+                            image_mode=None,
+                            elem_id="v2_input_image",
+                        )
+                        v2_run_ocr = gr.Checkbox(
+                            label="Run OCR",
+                            value=True,
+                            info=(
+                                "Extract text for each detected mask/bubble before translating. "
+                                "The engine follows Source Language: manga-ocr for Japanese, "
+                                "PP-OCRv5 Korean for Korean, PP-OCRv4 for Chinese/English, LLM "
+                                "vision for anything else (including Auto)."
+                            ),
+                            elem_id="v2_run_ocr",
+                        )
+                        with gr.Row():
+                            v2_source_language = gr.Dropdown(
+                                ["Auto"] + SOURCE_LANGUAGES,
+                                label="Source Language",
+                                value="Auto",
+                                allow_custom_value=True,
+                                info="Auto = biarkan model mendeteksi bahasanya sendiri.",
+                                elem_id="v2_source_language",
+                            )
+                            v2_target_language = gr.Dropdown(
+                                TARGET_LANGUAGES,
+                                label="Target Language",
+                                value="Indonesian",
+                                allow_custom_value=True,
+                                info="Bahasa hasil terjemahan.",
+                                elem_id="v2_target_language",
+                            )
+                        with gr.Row():
+                            v2_translate_button = gr.Button(
+                                "Translate V2", variant="primary"
+                            )
+                            v2_clear_button = gr.Button("Clear")
+                        v2_status_message = gr.Textbox(
+                            label="Translate V2 Status",
+                            interactive=False,
+                            elem_id="v2_status_message",
+                        )
+                        v2_dataframe = gr.Dataframe(
+                            headers=["#", "Type", "BBox", "OCR Text", "Translation"],
+                            datatype=["number", "str", "str", "str", "str"],
+                            interactive=False,
+                            label="Daftar Teks & Hasil Translasi",
+                            elem_id="v2_dataframe",
+                        )
+                    with gr.Column(scale=1):
+                        with gr.Tabs():
+                            with gr.TabItem("1. Deteksi & Mask"):
+                                v2_mask_image = gr.Image(
+                                    type="pil",
+                                    label="Area Mask / OCR (Kotak Merah)",
+                                    interactive=False,
+                                    elem_id="v2_mask_image",
+                                )
+                            with gr.TabItem("2. Hasil Redraw / Cleaning"):
+                                v2_cleaned_image = gr.Image(
+                                    type="pil",
+                                    label="Hasil Redraw / Inpainting (Cleaning)",
+                                    interactive=False,
+                                    elem_id="v2_cleaned_image",
+                                )
+                            with gr.TabItem("3. Hasil Final Typesetting"):
+                                v2_final_image = gr.Image(
+                                    type="pil",
+                                    label="Hasil Final Typesetting",
+                                    interactive=False,
+                                    elem_id="v2_final_image",
+                                )
+
             with gr.TabItem("Batch"):  # noqa: SIM117
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -4118,6 +4197,59 @@ def create_layout(
             queue=False,
         ).then(fn=None, js=js_reset_status_height, queue=False)
 
+        def _with_v2_language_overrides(components: list) -> list:
+            """Use the Translate V2 tab's own language dropdowns."""
+            return [
+                v2_source_language
+                if component is input_language
+                else v2_target_language
+                if component is output_language
+                else component
+                for component in components
+            ]
+
+        v2_clear_button.click(
+            fn=lambda: (None, None, None, None, [], gr.update(value="", lines=1)),
+            outputs=[
+                v2_input_image,
+                v2_mask_image,
+                v2_cleaned_image,
+                v2_final_image,
+                v2_dataframe,
+                v2_status_message,
+            ],
+            queue=False,
+        ).then(fn=None, js=js_reset_status_height, queue=False)
+
+        v2_inputs = [v2_input_image, v2_run_ocr] + _with_v2_language_overrides(
+            translate_inputs[1:]
+        )
+
+        v2_event = v2_translate_button.click(
+            fn=functools.partial(callbacks.update_translate_v2_buttons, processing=True),
+            outputs=[v2_translate_button, v2_clear_button],
+            queue=False,
+        ).then(
+            fn=functools.partial(
+                callbacks.handle_translate_v2_click,
+                models_dir=models_dir,
+                fonts_base_dir=fonts_base_dir,
+                target_device=target_device,
+            ),
+            inputs=v2_inputs,
+            outputs=[
+                v2_mask_image,
+                v2_cleaned_image,
+                v2_final_image,
+                v2_dataframe,
+                v2_status_message,
+            ],
+        )
+        v2_event.then(
+            fn=functools.partial(callbacks.update_translate_v2_buttons, processing=False),
+            outputs=[v2_translate_button, v2_clear_button],
+            queue=False,
+        ).then(fn=None, js=js_reset_status_height, queue=False)
 
         app.load(
             fn=callbacks.handle_app_load,

@@ -350,6 +350,39 @@ def simulate_translate_pipeline_logic(
                     f"Failed to clean up temporary file: {e_clean}", always_print=True
                 )
 
+def translate_v2_logic(
+    image: str | Path | Image.Image,
+    config: MangaTranslatorConfig,
+    models_dir: Path,
+    run_ocr: bool = True,
+    cancellation_manager: Optional["CancellationManager"] = None,
+) -> tuple[Image.Image, Image.Image, Image.Image, list[list[Any]], str]:
+    """Translate V2: detect & mask (with OCR), then translate & typeset in one call."""
+    annotated, _gallery, _rows, mask_status, cache = simulate_manga_logic(
+        image=image,
+        config=config,
+        models_dir=models_dir,
+        run_ocr=run_ocr,
+        cancellation_manager=cancellation_manager,
+    )
+
+    ocr_texts = cache.get("ocr_texts") if isinstance(cache, dict) else None
+    if ocr_texts and all(t == "(OCR skipped)" for t in ocr_texts):
+        ocr_texts = None
+
+    cleaned, final, table_rows, translate_status = simulate_translate_pipeline_logic(
+        image=image,
+        config=config,
+        models_dir=models_dir,
+        cancellation_manager=cancellation_manager,
+        pre_detected_items=(
+            cache.get("sorted_items") if isinstance(cache, dict) else None
+        ),
+        pre_extracted_ocr_texts=ocr_texts,
+        pre_outside_work=cache.get("outside_work") if isinstance(cache, dict) else None,
+    )
+    return annotated, cleaned, final, table_rows, f"{mask_status}\n\n{translate_status}"
+
 
 def process_batch_logic(
     input_dir_or_files: str | list[str] | dict[str, Any],

@@ -1094,6 +1094,77 @@ def update_sim_translate_buttons(processing: bool):
         gr.update(interactive=not processing),
     )
 
+def update_translate_v2_buttons(processing: bool):
+    """Toggle the Translate V2 button."""
+    global CANCELLATION_MANAGER
+    if not processing:
+        CANCELLATION_MANAGER = None
+    return (
+        gr.update(
+            interactive=not processing,
+            value="Translating..." if processing else "Translate V2",
+        ),
+        gr.update(interactive=not processing),
+    )
+
+def handle_translate_v2_click(
+    *args: Any,
+    models_dir: Path,
+    fonts_base_dir: Path,
+    target_device: torch.device | None,
+) -> tuple[
+    Image.Image | None, Image.Image | None, Image.Image | None, list[list[Any]], str
+]:
+    """Callback for the 'Translate V2' button: detect & mask, then translate & typeset."""
+    input_image_path = args[0]
+    run_ocr = bool(args[1])
+    global CANCELLATION_MANAGER
+    CANCELLATION_MANAGER = CancellationManager()
+    try:
+        img_valid, img_msg = utils.validate_image(input_image_path)
+        if not img_valid:
+            raise gr.Error(f"{ERROR_PREFIX}{img_msg}")
+
+        ui_state = _build_ui_state_from_args(args[2:], is_batch=False)
+        backend_config = map_ui_to_backend_config(
+            ui_state=ui_state,
+            fonts_base_dir=fonts_base_dir,
+            target_device=target_device,
+            is_batch=False,
+        )
+        backend_config.cleaning_only = False
+
+        mask_img, cleaned_img, final_img, table_rows, status_msg = (
+            logic.translate_v2_logic(
+                image=input_image_path,
+                config=backend_config,
+                models_dir=models_dir,
+                run_ocr=run_ocr,
+                cancellation_manager=CANCELLATION_MANAGER,
+            )
+        )
+        return mask_img, cleaned_img, final_img, table_rows, _status_update(status_msg)
+
+    except gr.Error as e:
+        cleaned = _clean_error_message(e)
+        gr.Error(cleaned)
+        return None, None, None, [], _status_update(cleaned)
+    except CancellationError:
+        return None, None, None, [], _status_update("Translation cancelled.")
+    except (ValidationError, FileNotFoundError, ValueError, logic.LogicError) as e:
+        cleaned = _clean_error_message(e)
+        gr.Error(cleaned)
+        return None, None, None, [], _status_update(cleaned)
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        cleaned = _clean_error_message(
+            f"An unexpected error occurred during Translate V2: {e!s}"
+        )
+        gr.Error(cleaned)
+        return None, None, None, [], _status_update(cleaned)
+
 
 def handle_zip_or_failed_paths_upload(
     file_path: str | None,

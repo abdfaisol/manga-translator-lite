@@ -61,13 +61,17 @@ User-friendly app for automating the translation of manga, manhwas, and comics u
 
 ### 3. Translate
 
-- **Web UI:** Upload images to the Translator/Batch tab and click Translate.
+- **Web UI:** Upload images to the Translator/Batch tab and click Translate. Use the **Translate V2** tab to run detection & masking followed by translation in a single click (defaults to Source Language `Auto` and Target Language `Indonesian`).
 - **CLI:**
   ```bash
   python main.py --input "path/to/page.jpg" --input-language "Japanese" --output-language "English" --font-dir "fonts/Komika Hand" --provider Google --google-api-key <...> --osb-enable --osb-font-dir "fonts/Comicka" --osb-hf-token <...>
   ```
+- **API:**
+  ```bash
+  python api.py # http://127.0.0.1:8000/docs
+  ```
 
-*For additional examples, see [CLI](docs/CLI.md).*
+*For additional examples, see [CLI](docs/CLI.md) and [API](docs/API.md).*
 
 > [!TIP]
 > You can enable `Cleaning-only Mode` by navigating to Config -> Other in the Web UI, or pass `--cleaning-only` in the CLI, to remove text without translating (e.g., for manual scanlation).
@@ -77,7 +81,7 @@ User-friendly app for automating the translation of manga, manhwas, and comics u
 ## Features
 
 - **Automation**: One-click translation; no manual intervention required
-- **Interfaces**: Web UI (Gradio) and CLI
+- **Interfaces**: Web UI (Gradio), CLI, and local HTTP API (FastAPI)
 - **Processing**: Single image, folder, and ZIP archive batch processing (with directory preservation)
 - **Detection**: Speech bubble and outside-bubble text detection (YOLO, SAM 2.1/3)
 - **Cleaning**: Inpaint speech bubbles and background text (FLUX.2 Klein, FLUX.1 Kontext, or OpenCV)
@@ -94,6 +98,7 @@ User-friendly app for automating the translation of manga, manhwas, and comics u
 - [Installation](docs/INSTALLATION.md)
 - [Configuration](docs/CONFIGURATION.md)
 - [CLI](docs/CLI.md)
+- [API](docs/API.md)
 - [Fonts](docs/FONTS.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 

@@ -25,3 +25,5 @@ python main.py --input <image_path> --upscaling-only --image-upscale-mode final 
 # Full options
 python main.py --help
 ```
+
+*For HTTP usage, see [API](API.md).*
