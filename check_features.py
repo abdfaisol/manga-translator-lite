@@ -7,6 +7,7 @@ new "Translate V2" tab exists while the pre-existing Translator / Simulasi / Bat
 tabs are untouched. Also asserts the API defaults (source Auto, target Indonesian).
 """
 
+import ast
 import sys
 from pathlib import Path
 
@@ -95,6 +96,8 @@ check("api has /translate", "/translate" in routes)
 # Keep docs/API.md honest: every documented parameter must exist with the documented default.
 schema = api.app.openapi()
 docs = Path("docs/API.md").read_text(encoding="utf-8")
+api_src = Path("api.py").read_text(encoding="utf-8")
+api_tree = ast.parse(api_src)
 
 EXPECTED = {
     "/detect": {
@@ -134,8 +137,103 @@ for path, expected in EXPECTED.items():
     check(f"{path} multipart field named image", "image" in body_schema.get("properties", {}))
     check(f"{path} documented in docs/API.md", f"`{path}`" in docs)
 
+# docs/API.md must show a request AND a response for every endpoint, not just a
+# bare curl line. (The response bodies are illustrative, so only the shapes are checked.)
+for heading in ("### `GET /health`", "### `POST /translate`", "### `POST /detect`"):
+    check(f"docs/API.md has section {heading}", heading in docs)
+check("docs/API.md shows a PNG response", "content-type: image/png" in docs)
+check("docs/API.md shows an error response", "HTTP/1.1 500 Internal Server Error" in docs)
+check("docs/API.md documents concurrency limit", "MANGA_API_MAX_CONCURRENT" in docs)
+
+# The JSON example must match what _respond() actually emits.
+respond_src = ast.get_source_segment(
+    api_src,
+    next(
+        n
+        for n in ast.walk(api_tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_respond"
+    ),
+)
+for key in ("status", "rows", "image", "mask_image"):
+    check(f'_respond emits "{key}"', f'"{key}"' in respond_src)
+    check(f'docs/API.md documents "{key}"', f'"{key}"' in docs)
+
+# Row shape documented in the response example must match _rows_to_dicts().
+rows_src = ast.get_source_segment(
+    api_src,
+    next(
+        n
+        for n in ast.walk(api_tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_rows_to_dicts"
+    ),
+)
+for field in ("index", "type", "bbox", "ocr_text", "translation"):
+    check(f'_rows_to_dicts emits "{field}"', f'"{field}"' in rows_src)
+    check(f'docs/API.md shows row field "{field}"', f'"{field}":' in docs)
+
+# /health is cheap enough to exercise for real (no model is loaded).
+from fastapi.testclient import TestClient
+
+with TestClient(api.app) as client:
+    health = client.get("/health")
+    check("GET /health -> 200", health.status_code == 200, health.status_code)
+    check("GET /health body", health.json() == {"status": "ok"}, health.text)
+
 check("README links docs/API.md", "docs/API.md" in Path("README.md").read_text(encoding="utf-8"))
 check("README mentions Translate V2 tab", "Translate V2" in Path("README.md").read_text(encoding="utf-8"))
+
+# clamp_settings() indexes SETTING_CONSTRAINTS by every key in _CONFIG_ATTR_PATHS,
+# so any key present in one map but not the other used to crash the CLI at startup.
+from core.config import MangaTranslatorConfig
+from core.validation import SETTING_CONSTRAINTS, _CONFIG_ATTR_PATHS, clamp_settings
+
+orphan_paths = sorted(set(_CONFIG_ATTR_PATHS) - set(SETTING_CONSTRAINTS))
+check("every clamp attr path has a numeric range", not orphan_paths, ",".join(orphan_paths))
+check(
+    "every clamp key maps to a real config attr",
+    all(p[0] in MangaTranslatorConfig.__dataclass_fields__ for paths in _CONFIG_ATTR_PATHS.values() for p in paths),
+)
+
+# Regression: this exact config used to raise KeyError inside clamp_settings.
+_clamp_cfg = MangaTranslatorConfig.__new__(MangaTranslatorConfig)
+try:
+    clamp_settings(_clamp_cfg)
+    check("clamp_settings tolerates a bare config", True)
+except Exception as exc:  # noqa: BLE001
+    check("clamp_settings tolerates a bare config", False, f"{type(exc).__name__}: {exc}")
+
+# Both endpoints must hold a job slot while doing the heavy work, or a burst of
+# requests all runs at once and can OOM the whole process.
+check("api MAX_CONCURRENT >= 1", api.MAX_CONCURRENT >= 1, api.MAX_CONCURRENT)
+check(
+    "api semaphore sized to MAX_CONCURRENT",
+    api._job_slots._value == api.MAX_CONCURRENT,  # noqa: SLF001
+    api._job_slots._value,  # noqa: SLF001
+)
+for fn_name in ("detect", "translate"):
+    fn = next(
+        n for n in ast.walk(api_tree) if isinstance(n, ast.FunctionDef) and n.name == fn_name
+    )
+    calls = {ast.unparse(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)}
+    check(f"{fn_name} acquires a job slot", "_job_slots.acquire" in calls)
+    check(f"{fn_name} releases its job slot", "_job_slots.release" in calls)
+
+# A slot must be released even when the work raises, otherwise the API wedges
+# after MAX_CONCURRENT failures.
+def _release_on_error():
+    api._job_slots.acquire()  # noqa: SLF001
+    try:
+        raise RuntimeError("boom")
+    finally:
+        api._job_slots.release()  # noqa: SLF001
+
+
+before = api._job_slots._value  # noqa: SLF001
+try:
+    _release_on_error()
+except RuntimeError:
+    pass
+check("job slot released after an exception", api._job_slots._value == before)  # noqa: SLF001
 
 # `mgtranslate start [--api]` must dispatch to app.main / api.main.
 # (Stub the real mains so nothing is actually launched.)

@@ -19,8 +19,10 @@ override per request with query parameters.
 import argparse
 import base64
 import io
+import os
 import tempfile
 from pathlib import Path
+import threading
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
@@ -38,6 +40,12 @@ FONTS_DIR = REPO_ROOT / "fonts"
 
 DEFAULT_SOURCE_LANGUAGE = "Auto"
 DEFAULT_TARGET_LANGUAGE = "Indonesian"
+
+# How many pages may be processed at once. Extra requests wait instead of
+# fighting over VRAM/RAM (and instead of taking the whole process down on OOM).
+# Raise it if you have VRAM to spare, lower it to 1 on a weak GPU.
+MAX_CONCURRENT = max(1, int(os.environ.get("MANGA_API_MAX_CONCURRENT", "2")))
+_job_slots = threading.Semaphore(MAX_CONCURRENT)
 
 app = FastAPI(title="MangaTranslator API", version="2.0")
 
@@ -153,6 +161,7 @@ def detect(
         model_name=model_name,
     )
     path = _stage_upload(image)
+    _job_slots.acquire()
     try:
         annotated, _, rows, status, _ = simulate_mask_and_ocr(
             path, config, run_ocr=run_ocr, verbose=False
@@ -161,6 +170,7 @@ def detect(
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
     finally:
         path.unlink(missing_ok=True)
+        _job_slots.release()
 
     return _respond(annotated, as_json=as_json, status=status, rows=rows)
 
@@ -184,6 +194,7 @@ def translate(
         model_name=model_name,
     )
     path = _stage_upload(image)
+    _job_slots.acquire()
     try:
         annotated, _, _, _, cache = simulate_mask_and_ocr(
             path, config, run_ocr=run_ocr, verbose=False
@@ -200,6 +211,7 @@ def translate(
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}") from e
     finally:
         path.unlink(missing_ok=True)
+        _job_slots.release()
 
     return _respond(
         final, as_json=as_json, status=status, rows=rows, mask_image=annotated

@@ -124,9 +124,6 @@ _CONFIG_ATTR_PATHS: dict[str, tuple[tuple[str, ...], ...]] = {
     "outside_text_osb_min_font_size": (("outside_text", "osb_min_font_size"),),
     "outside_text_osb_line_spacing": (("outside_text", "osb_line_spacing"),),
     "outside_text_osb_padding_pixels": (("outside_text", "osb_padding_pixels"),),
-    "outside_text_osb_auto_vertical_text": (
-        ("outside_text", "osb_auto_vertical_text"),
-    ),
     "outside_text_osb_vertical_line_spacing_mult": (
         ("outside_text", "osb_vertical_line_spacing_mult"),
     ),
@@ -176,6 +173,9 @@ def clamp_settings(settings: Any) -> Any:
     for key, paths in _CONFIG_ATTR_PATHS.items():
         if not hasattr(settings, "__dict__"):
             break
+        # Non-numeric settings (booleans, strings) have no range to clamp.
+        if key not in SETTING_CONSTRAINTS:
+            continue
         min_val, max_val = SETTING_CONSTRAINTS[key]
         for path in paths:
             target = settings

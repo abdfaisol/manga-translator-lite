@@ -69,6 +69,7 @@ User-friendly app for automating the translation of manga, manhwas, and comics u
 - **API:**
   ```bash
   mgtranslate start --api # http://127.0.0.1:8000/docs
+  curl.exe -X POST "http://127.0.0.1:8000/translate" -F "image=@page.jpg" -o translated.png
   ```
 
 *For additional examples, see [CLI](docs/CLI.md) and [API](docs/API.md).*
