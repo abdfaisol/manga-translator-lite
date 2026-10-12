@@ -36,12 +36,12 @@ User-friendly app for automating the translation of manga, manhwas, and comics u
 
 ### 1. Download
 
-- **Portable Package (Recommended):** Download the portable build from [Releases](https://github.com/meangrinch/MangaTranslator/releases/tag/portable).
+- **Portable Package (Recommended):** Download the portable build from [Releases](https://github.com/abdfaisol/manga-translator-lite/releases/tag/portable).
   - Windows: No requirements.
   - Linux / macOS: Requires Python 3.10+ and Git.
 - **From Source:**
   ```bash
-  git clone https://github.com/meangrinch/MangaTranslator.git
+  git clone https://github.com/abdfaisol/manga-translator-lite.git
   cd MangaTranslator
   python -m venv venv
   .\venv\Scripts\activate # or source venv/bin/activate (Linux/macOS)
@@ -68,7 +68,7 @@ User-friendly app for automating the translation of manga, manhwas, and comics u
   ```
 - **API:**
   ```bash
-  python api.py # http://127.0.0.1:8000/docs
+  mgtranslate start --api # http://127.0.0.1:8000/docs
   ```
 
 *For additional examples, see [CLI](docs/CLI.md) and [API](docs/API.md).*
@@ -108,18 +108,12 @@ User-friendly app for automating the translation of manga, manhwas, and comics u
 
 MangaTranslator is open-source and free. If it saves you time or enhances your reading experience, consider supporting its development!
 
-<p align="center">
-  <a href="https://ko-fi.com/grinnch" target="_blank">
-    <img src="https://storage.ko-fi.com/cdn/kofi2.png?v=3" alt="Support on Ko-fi" height="38"/>
-  </a>
-</p>
-
 ---
 
 ## License & Credits
 
 - License: Apache-2.0 (see [LICENSE](LICENSE))
-- Author: [grinnch](https://github.com/meangrinch)
+- Author: [abdfaisol](https://github.com/abdfaisol)
 
 <details>
 <summary><b>ML Models and Libraries</b></summary>

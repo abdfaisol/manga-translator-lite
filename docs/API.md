@@ -3,15 +3,37 @@
 Run `api.py` to translate pages over HTTP instead of the Web UI or CLI.
 
 ```bash
-python api.py                      # http://127.0.0.1:8000  (docs at /docs)
-python api.py --port 9000
-python api.py --host 0.0.0.0 --reload
+mgtranslate start --api          # http://127.0.0.1:8000  (docs at /docs)
+mgtranslate start --api --port 9000
+mgtranslate start --api --host 0.0.0.0 --reload
+```
+
+`mgtranslate start` (without `--api`) starts the Web UI on port `7676` instead. `--port`, `--host`, `--reload`, `--models` and `--cpu` are forwarded to the underlying launcher.
+
+`mgtranslate` comes from the package entry point, so it needs an editable install once:
+
+```bash
+pip install -e . --no-deps
+```
+
+Without the entry point, `python api.py` does the same thing:
+
+```bash
+python api.py
 ```
 
 Interactive docs (Swagger UI) are available at `http://127.0.0.1:8000/docs`.
 
 > [!NOTE]
 > The API is local-only by default (`127.0.0.1`) and has **no authentication**. Only bind to `0.0.0.0` on a trusted network.
+
+### Run detached (no console window)
+
+```powershell
+Start-Process -WindowStyle Hidden .\venv\Scripts\mgtranslate.exe -ArgumentList "start","--api"
+```
+
+Stop it with `taskkill /IM mgtranslate.exe /F`. For auto-start at logon, point Task Scheduler at the same command with "Run whether user is logged on or not". Note that idle models still hold RAM/VRAM once loaded.
 
 ## Endpoints
 

@@ -20,6 +20,7 @@ Issues = "https://github.com/meangrinch/MangaTranslator/issues"
 [project.scripts]
 manga-translator = "main:main"
 manga-translator-web = "app:main"
+mgtranslate = "cli:main"
 
 [project.optional-dependencies]
 dev = ["ruff", "pytest"]
@@ -32,7 +33,7 @@ extend-select = ["I"]
 ignore = ["BLE001", "S110"]
 
 [tool.setuptools]
-py-modules = ["app", "main"]
+py-modules = ["app", "main", "api", "cli"]
 
 [tool.setuptools.packages.find]
 include = ["core*", "ui*", "utils*"]

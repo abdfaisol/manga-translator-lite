@@ -137,5 +137,24 @@ for path, expected in EXPECTED.items():
 check("README links docs/API.md", "docs/API.md" in Path("README.md").read_text(encoding="utf-8"))
 check("README mentions Translate V2 tab", "Translate V2" in Path("README.md").read_text(encoding="utf-8"))
 
+# `mgtranslate start [--api]` must dispatch to app.main / api.main.
+# (Stub the real mains so nothing is actually launched.)
+import importlib
+
+import cli
+
+check("api.main callable", callable(api.main))
+for argv, expected in ((["start"], "app"), (["start", "--api"], "api")):
+    seen = {}
+    for name in ("app", "api"):
+        mod = importlib.import_module(name)
+        mod.main = (lambda n: lambda *a, **k: seen.setdefault("target", n))(name)
+    cli.main(argv)
+    check(f"mgtranslate {' '.join(argv)} -> {expected}", seen.get("target") == expected, seen.get("target"))
+
+pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+check("pyproject declares mgtranslate script", 'mgtranslate = "cli:main"' in pyproject)
+check("pyproject ships cli module", '"cli"' in pyproject)
+
 print(f"\nTOTAL {total} FAILED {len(failures)}")
 sys.exit(1 if failures else 0)
