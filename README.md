@@ -36,13 +36,13 @@ User-friendly app for automating the translation of manga, manhwas, and comics u
 
 ### 1. Download
 
-- **Portable Package (Recommended):** Download the portable build from [Releases](https://github.com/abdfaisol/manga-translator-lite/releases/tag/portable).
+- **Portable Package (Recommended):** Download the portable build from [Releases](https://github.com/abdfaisol/MangaTranslator/releases/tag/portable).
   - Windows: No requirements.
   - Linux / macOS: Requires Python 3.10+ and Git.
 - **From Source:**
   ```bash
   git clone https://github.com/abdfaisol/manga-translator-lite.git
-  cd MangaTranslator
+  cd manga-translator-lite
   python -m venv venv
   .\venv\Scripts\activate # or source venv/bin/activate (Linux/macOS)
   pip install torch==2.11.0+cu130 torchvision==0.26.0+cu130 --extra-index-url https://download.pytorch.org/whl/cu130 # or pip install torch==2.11.0 torchvision==0.26.0 (macOS)
@@ -104,16 +104,10 @@ User-friendly app for automating the translation of manga, manhwas, and comics u
 
 ---
 
-## Support the Project
-
-MangaTranslator is open-source and free. If it saves you time or enhances your reading experience, consider supporting its development!
-
----
-
 ## License & Credits
 
 - License: Apache-2.0 (see [LICENSE](LICENSE))
-- Author: [abdfaisol](https://github.com/abdfaisol)
+- Author: [grinnch](https://github.com/abdfaisol)
 
 <details>
 <summary><b>ML Models and Libraries</b></summary>
